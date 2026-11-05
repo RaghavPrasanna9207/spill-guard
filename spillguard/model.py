@@ -83,7 +83,8 @@ class Plan:
         return self.spilled.sum() / self.demand_total
 
 
-def resolve_limits(base, floor_cap=None, crowding=None, pack_cap=None):
+def resolve_limits(base, floor_cap=None, crowding=None, pack_cap=None, agency_daily=None,
+                   agency_night=None):
     """Floor and supply limits; unset ones default to config multiples of `base`.
 
     floor_cap: most pickers (permanent + temps) on the floor in any hour
@@ -92,6 +93,10 @@ def resolve_limits(base, floor_cap=None, crowding=None, pack_cap=None):
         (default CROWDING_MULT x base).
     pack_cap: most orders packed per wave, so most picked (default PACK_STATIONS_MULT x base
         stations x PACK_RATE).
+    agency_daily: most temp shifts the agency fills per window day (default
+        AGENCY_DAILY_MULT x base).
+    agency_night: most of those starting in night hours, 22:00-04:00 (default
+        AGENCY_NIGHT_MULT x base).
     """
     floor_cap = cfg.FLOOR_CAP_MULT * base if floor_cap is None else floor_cap
     crowding = cfg.CROWDING_MULT * base if crowding is None else crowding
@@ -99,7 +104,10 @@ def resolve_limits(base, floor_cap=None, crowding=None, pack_cap=None):
         raise ValueError("need base headcount <= crowding threshold <= floor cap")
     if pack_cap is None:
         pack_cap = cfg.PACK_STATIONS_MULT * base * cfg.PACK_RATE
-    return SimpleNamespace(floor_cap=floor_cap, crowding=crowding, pack_cap=pack_cap)
+    agency_daily = cfg.AGENCY_DAILY_MULT * base if agency_daily is None else agency_daily
+    agency_night = cfg.AGENCY_NIGHT_MULT * base if agency_night is None else agency_night
+    return SimpleNamespace(floor_cap=floor_cap, crowding=crowding, pack_cap=pack_cap,
+                           agency_daily=agency_daily, agency_night=agency_night)
 
 
 def solve(demand, tier_values, base, deps=None, max_temps=None, fixed_temps=None,
@@ -129,23 +137,38 @@ def solve(demand, tier_values, base, deps=None, max_temps=None, fixed_temps=None
             if temps.sum() <= max_temps:
                 break
             temps[t] = max(temps[t] - 1, 0)
+    # Rounding up can also ask the agency for more than it supplies; trim the most-rounded
+    # start hour in each over-cap group. Terminates for the same reason as the floor below.
+    for hours, cap in lp.supply:
+        while temps[hours].sum() > cap + 1e-9:
+            temps[hours[np.argmax((temps - frac)[hours])]] -= 1
     # Rounding up can overfill the floor; trim the most-rounded start hour covering each
     # overfull wave. Terminates: rounded-down temps never exceed the LP's, which fit.
     while (over := np.flatnonzero(on_shift(temps, lp.W) > lp.lim.floor_cap - base + 1e-9)).size:
         w = over[0]
         window = np.arange(max(0, w - cfg.SHIFT_HOURS + 1), min(w, len(temps) - 1) + 1)
         temps[window[np.argmax((temps - frac)[window])]] -= 1
+    # Clean-up: drop a temp, or add one where the floor and agency allow, while total cost
+    # falls. Adds win back capacity the trims above removed (agency caps took the gap from
+    # 1.5% to 4.7% without them). Cost is convex in each hour's temps, so an hour's reduced
+    # cost rc bounds the move: adding can only help if rc < 0, removing only if rc > 0. Only
+    # those moves are tried, most promising first.
     best = lp.cost(temps)
-    improved = True
-    while improved:  # ponytail: removal moves only; add swaps if `gap` gets large
-        improved = False
-        for t in np.flatnonzero(temps):
-            temps[t] -= 1
+    while True:  # ponytail: single add/remove moves; try swaps if `gap` gets large
+        rc = np.array([v.reduced_cost() for v in lp.h])
+        moves = [(t, -1) for t in np.flatnonzero((temps > 0) & (rc > 1e-6))]
+        moves += [(t, 1) for t in np.flatnonzero(rc < -1e-6)]
+        for t, step in sorted(moves, key=lambda m: m[1] * rc[m[0]]):
+            if step == 1 and not lp.can_add(temps, t):
+                continue
+            temps[t] += step
             c = lp.cost(temps)
             if c < best - 1e-6:
-                best, improved = c, True
-            else:
-                temps[t] += 1
+                best = c
+                break  # the LP now holds this plan, so its reduced costs are current
+            temps[t] -= step
+        else:
+            break
     lp.cost(temps)
     plan = lp.plan()
     plan.lower_bound = bound
@@ -185,19 +208,19 @@ def marginal_roi(demand, tier_values, base, temps, deps=None, penalty_scale=1.0,
     """What one more temp starting at each hour would cost and save, on top of `temps`.
 
     Exact: re-solves the fixed-headcount LP per start hour (re-running solve() would add its
-    ~1-2% heuristic noise, about one temp's worth). Rows are NaN where the floor is already
-    full during part of that shift, so the extra temp could not work.
+    ~1-2% heuristic noise, about one temp's worth). Rows are NaN where the extra temp could
+    not work: the floor is already full during part of that shift, or the agency has no more
+    temps for that day or night.
     """
     lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, limits)
     temps = np.asarray(temps, float)
     lp.cost(temps)
     before = lp.plan()
-    on = on_shift(np.pad(temps, (0, lp.W - len(temps))), lp.W)
     H = len(temps)
     out = pd.DataFrame(np.nan, index=pd.RangeIndex(H, name="start"),
                        columns=["shift_cost", "spill_avoided", "orders_saved"])
     for t in range(H):
-        if (on[t:t + cfg.SHIFT_HOURS] >= lp.lim.floor_cap - base - 1e-9).any():
+        if not lp.can_add(temps, t):
             continue
         temps[t] += 1
         lp.cost(temps)
@@ -219,7 +242,7 @@ class _WaveLP:
         if deps is None:
             deps = [departures(s, W + BACKLOG_DELAY_H + 48) for s in cfg.DEST_STATES]
         rate = delay_cost_per_hour(tier_values, penalty_scale)
-        self.demand, self.rate = demand, rate
+        self.demand, self.rate, self.base = demand, rate, base
         solver = self.solver = pywraplp.Solver.CreateSolver("GLOP")
         inf = solver.infinity()
         h = self.h = [solver.NumVar(0, inf, f"h{t}") for t in range(H)]
@@ -231,7 +254,29 @@ class _WaveLP:
         limit = self.limit = solver.Constraint(0, inf if max_temps is None else max_temps)
         for t in range(H):
             limit.SetCoefficient(h[t], 1)
+        # Agency supply: (start hours, most temp shifts the agency can fill) per window day,
+        # all starts and night starts.
+        self.supply = []
+        for day in range(0, H, 24):
+            hours = np.arange(day, min(day + 24, H))
+            night = hours[np.isin(hours % 24, list(NIGHT_HOURS))]
+            self.supply += [(hours, lim.agency_daily), (night, lim.agency_night)]
+        for hours, cap in self.supply:
+            c = solver.Constraint(0, cap)
+            for t in hours:
+                c.SetCoefficient(h[t], 1)
         objective.SetMinimization()
+
+    def can_add(self, temps, t):
+        """Whether one more temp can start at hour t: within the temp cap, room on the floor for
+        the whole shift, and agency supply left for that day and night."""
+        if temps.sum() + 1 > self.limit.ub() + 1e-9:
+            return False
+        on = on_shift(np.pad(temps, (0, self.W - len(temps))), self.W)
+        if (on[t:t + cfg.SHIFT_HOURS] >= self.lim.floor_cap - self.base - 1e-9).any():
+            return False
+        return not any(t in hours and temps[hours].sum() + 1 > cap + 1e-9
+                       for hours, cap in self.supply)
 
     def _solve(self):
         if self.solver.Solve() != pywraplp.Solver.OPTIMAL:

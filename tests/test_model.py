@@ -15,8 +15,13 @@ DEPS = [np.array([3.0, 27.0, 51.0, 75.0, 99.0, 123.0])]
 VALUES = [100.0]  # R$ per order -> 10 + 100 x 0.05 = R$15 per day late
 
 
+# All four hand-case start hours are night hours and base=1 gives a 1.5 night cap, so agency
+# caps are off here unless a test sets them.
+HAND = dict(deps=DEPS, agency_daily=99, agency_night=99)
+
+
 def solve(**kw):
-    return model.solve(DEMAND, VALUES, base=1, deps=DEPS, **kw)
+    return model.solve(DEMAND, VALUES, base=1, **{**HAND, **kw})
 
 
 def test_no_temps_spills_the_excess():
@@ -68,7 +73,7 @@ def test_lp_with_milp_headcount_reproduces_milp():
 def test_frontier_trades_labour_for_spill_linearly_on_hand_case():
     # Each fractional temp in wave 1 saves 40 orders x R$15, more than its ~R$190, so the LP
     # optimum hires 1.25 temps and clears all 50 excess orders; spill falls linearly to it.
-    plans = model.frontier(DEMAND, VALUES, base=1, deps=DEPS, points=6)
+    plans = model.frontier(DEMAND, VALUES, base=1, points=6, **HAND)
     caps = [p.temps.sum() for p in plans]
     assert caps == pytest.approx([0, 0.25, 0.5, 0.75, 1, 1.25])
     for cap, p in zip(caps, plans):
@@ -87,8 +92,25 @@ def test_packing_caps_picks_and_hiring():
 
 def test_extra_temps_save_nothing_when_packing_binds():
     # One temp already lifts picking to 90 = packing capacity: a second one adds nothing.
-    roi = model.marginal_roi(DEMAND, VALUES, 1, [0, 1, 0, 0], deps=DEPS, pack_cap=90)
+    roi = model.marginal_roi(DEMAND, VALUES, 1, [0, 1, 0, 0], pack_cap=90, **HAND)
     assert list(roi.spill_avoided) == pytest.approx([0, 0, 0, 0])
+
+
+def test_agency_night_cap_limits_hiring():
+    # The 2x penalty wants 2 temps, both starting at night (hours 0-1); the agency fills one.
+    plan = solve(penalty_scale=2, agency_night=1)
+    assert plan.temps.sum() == 1
+    assert plan.spilled.sum() == pytest.approx(10)
+
+
+def test_rounding_up_respects_agency_cap():
+    # The LP hires 1.25 temps; rounding up to 2 would break a 1.5-shift daily cap.
+    assert solve(penalty_scale=2, agency_daily=1.5).temps.sum() == 1
+
+
+def test_marginal_roi_skips_hours_the_agency_cannot_fill():
+    roi = model.marginal_roi(DEMAND, VALUES, 1, [0, 1, 0, 0], **{**HAND, "agency_night": 1})
+    assert roi.net.isna().all()
 
 
 needs_olist = pytest.mark.skipif(not (data.RAW / "olist_orders_dataset.csv").exists(),
@@ -106,7 +128,7 @@ def test_marginal_roi_on_hand_case():
     # One temp covering wave 1 (start 0 or 1) gets 40 more orders onto the 03:00 truck:
     # 40 x R$15 = R$600. Later starts miss that truck, and everything waiting already
     # catches the next one, so they save nothing.
-    roi = model.marginal_roi(DEMAND, VALUES, 1, np.zeros(4), deps=DEPS)
+    roi = model.marginal_roi(DEMAND, VALUES, 1, np.zeros(4), **HAND)
     assert list(roi.spill_avoided) == pytest.approx([600, 600, 0, 0])
     assert list(roi.orders_saved) == pytest.approx([40, 40, 0, 0])
     assert roi.net[1] == pytest.approx(600 - model.shift_cost(1))
@@ -114,7 +136,8 @@ def test_marginal_roi_on_hand_case():
 
 def test_marginal_roi_skips_hours_with_a_full_floor():
     # A 2-picker floor with one temp already on shift: every start overlaps a full wave.
-    roi = model.marginal_roi(DEMAND, VALUES, 1, [0, 1, 0, 0], deps=DEPS, floor_cap=2, crowding=1)
+    roi = model.marginal_roi(DEMAND, VALUES, 1, [0, 1, 0, 0], floor_cap=2, crowding=1,
+                             **HAND)
     assert roi.net.isna().all()
 
 

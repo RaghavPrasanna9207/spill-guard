@@ -48,6 +48,10 @@ SHIFT_HOURS = 8
 FLOOR_CAP_MULT = 4               # ASSUMPTION: floor holds 4x the permanent headcount
 CROWDING_MULT = 3                # ASSUMPTION: aisles congest above 3x (75% of the floor)
 CROWDED_RATE = 25                # ASSUMPTION: orders/h added by each picker above the threshold
+# Agency supply. Temps come from an agency that can only fill so many shifts a day, and
+# fewer at night. Scaled with permanent headcount like the floor cap: 30/day, 6 at night.
+AGENCY_DAILY_MULT = 7.5          # ASSUMPTION: temp shift starts per day the agency can fill
+AGENCY_NIGHT_MULT = 1.5          # ASSUMPTION: of those, starts in night hours (22:00-04:00)
 # Packing. Manual single-item packing runs 40-80 orders per packer-hour (Racklify pack-rate
 # benchmarks, vendor figures); Olist orders are nearly all single-item.
 PACK_RATE = 60                   # orders/h per staffed pack station
