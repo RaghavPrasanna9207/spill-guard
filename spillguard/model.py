@@ -12,6 +12,7 @@ import math
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 from ortools.linear_solver import pywraplp
 
 from spillguard import config as cfg
@@ -161,6 +162,35 @@ def wave_picks(demand, tier_values, base, temps, deps=None, penalty_scale=1.0, f
     out = np.zeros((lp.W,) + demand.shape[1:])
     for s, v, w, _, x in lp.picks:
         out[w, s, v] += x.solution_value()
+    return out
+
+
+def marginal_roi(demand, tier_values, base, temps, deps=None, penalty_scale=1.0, floor_cap=None,
+                 crowding=None):
+    """What one more temp starting at each hour would cost and save, on top of `temps`.
+
+    Exact: re-solves the fixed-headcount LP per start hour (re-running solve() would add its
+    ~1-2% heuristic noise, about one temp's worth). Rows are NaN where the floor is already
+    full during part of that shift, so the extra temp could not work.
+    """
+    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, floor_cap, crowding)
+    temps = np.asarray(temps, float)
+    lp.cost(temps)
+    before = lp.plan()
+    on = on_shift(np.pad(temps, (0, lp.W - len(temps))), lp.W)
+    H = len(temps)
+    out = pd.DataFrame(np.nan, index=pd.RangeIndex(H, name="start"),
+                       columns=["shift_cost", "spill_avoided", "orders_saved"])
+    for t in range(H):
+        if (on[t:t + cfg.SHIFT_HOURS] >= lp.floor_cap - base - 1e-9).any():
+            continue
+        temps[t] += 1
+        lp.cost(temps)
+        after = lp.plan()
+        temps[t] -= 1
+        out.loc[t] = [shift_cost(t), before.spill_cost - after.spill_cost,
+                      before.spilled.sum() - after.spilled.sum()]
+    out["net"] = out.spill_avoided - out.shift_cost
     return out
 
 

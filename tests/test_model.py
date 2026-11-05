@@ -76,13 +76,47 @@ def test_frontier_trades_labour_for_spill_linearly_on_hand_case():
         assert p.labour_cost == pytest.approx(model.shift_cost(1) * cap)  # 01:00 start is cheapest
 
 
-@pytest.mark.skipif(not (data.RAW / "olist_orders_dataset.csv").exists(),
-                    reason="Olist CSVs not in data/raw")
-def test_frontier_on_black_friday():
+needs_olist = pytest.mark.skipif(not (data.RAW / "olist_orders_dataset.csv").exists(),
+                                 reason="Olist CSVs not in data/raw")
+
+
+def black_friday():
     orders = data.load_orders()
     base = model.base_headcount(data.forecast_demand(orders))
     demand = data.forecast_demand(orders, peak_surge=7.5, weekend_surge=3.3)  # ~hindsight surges
-    vals = data.tier_values(orders)
+    return demand, data.tier_values(orders), base
+
+
+def test_marginal_roi_on_hand_case():
+    # One temp covering wave 1 (start 0 or 1) gets 40 more orders onto the 03:00 truck:
+    # 40 x R$15 = R$600. Later starts miss that truck, and everything waiting already
+    # catches the next one, so they save nothing.
+    roi = model.marginal_roi(DEMAND, VALUES, 1, np.zeros(4), deps=DEPS)
+    assert list(roi.spill_avoided) == pytest.approx([600, 600, 0, 0])
+    assert list(roi.orders_saved) == pytest.approx([40, 40, 0, 0])
+    assert roi.net[1] == pytest.approx(600 - model.shift_cost(1))
+
+
+def test_marginal_roi_skips_hours_with_a_full_floor():
+    # A 2-picker floor with one temp already on shift: every start overlaps a full wave.
+    roi = model.marginal_roi(DEMAND, VALUES, 1, [0, 1, 0, 0], deps=DEPS, floor_cap=2, crowding=1)
+    assert roi.net.isna().all()
+
+
+@needs_olist
+def test_marginal_roi_matches_frontier_slope():
+    # Best extra temp's net saving ~ the drop in the LP bound from one more allowed temp.
+    demand, vals, base = black_friday()
+    plan = model.solve(demand, vals, base, max_temps=50)
+    roi = model.marginal_roi(demand, vals, base, plan.temps)
+    slope = plan.lower_bound - model.solve(demand, vals, base, max_temps=51).lower_bound
+    assert roi.net.max() == pytest.approx(slope, rel=0.05)
+    assert roi.net.isna().any()  # Black Friday's peak fills the floor
+
+
+@needs_olist
+def test_frontier_on_black_friday():
+    demand, vals, base = black_friday()
     start = time.perf_counter()
     plan = model.solve(demand, vals, base)
     assert time.perf_counter() - start < 10
