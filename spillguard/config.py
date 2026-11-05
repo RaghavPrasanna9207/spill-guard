@@ -48,6 +48,10 @@ SHIFT_HOURS = 8
 FLOOR_CAP_MULT = 4               # ASSUMPTION: floor holds 4x the permanent headcount
 CROWDING_MULT = 3                # ASSUMPTION: aisles congest above 3x (75% of the floor)
 CROWDED_RATE = 25                # ASSUMPTION: orders/h added by each picker above the threshold
+# Packing. Manual single-item packing runs 40-80 orders per packer-hour (Racklify pack-rate
+# benchmarks, vendor figures); Olist orders are nearly all single-item.
+PACK_RATE = 60                   # orders/h per staffed pack station
+PACK_STATIONS_MULT = 2.5         # ASSUMPTION: pack stations per permanent picker (10 at 4 pickers)
 # ponytail: capacity counted in orders/h, not items; ~1.14 items/order makes the gap small.
 TEMP_MONTHLY_WAGE = 2110         # R$, SP logistics temp job ads 2026 (R$2,000-2,120)
 WORKDAYS_PER_MONTH = 22

@@ -76,6 +76,21 @@ def test_frontier_trades_labour_for_spill_linearly_on_hand_case():
         assert p.labour_cost == pytest.approx(model.shift_cost(1) * cap)  # 01:00 start is cheapest
 
 
+def test_packing_caps_picks_and_hiring():
+    # Packing 60/wave: one temp would raise picking from 50 to 90 but only 10 more orders get
+    # packed (R$150 saved for ~R$190), so the optimum hires nobody and 50 spill.
+    plan = solve(pack_cap=60)
+    assert plan.temps.sum() == 0
+    assert plan.spilled.sum() == pytest.approx(50)
+    assert solve(pack_cap=60, fixed_temps=[0, 1, 0, 0]).spilled.sum() == pytest.approx(40)
+
+
+def test_extra_temps_save_nothing_when_packing_binds():
+    # One temp already lifts picking to 90 = packing capacity: a second one adds nothing.
+    roi = model.marginal_roi(DEMAND, VALUES, 1, [0, 1, 0, 0], deps=DEPS, pack_cap=90)
+    assert list(roi.spill_avoided) == pytest.approx([0, 0, 0, 0])
+
+
 needs_olist = pytest.mark.skipif(not (data.RAW / "olist_orders_dataset.csv").exists(),
                                  reason="Olist CSVs not in data/raw")
 

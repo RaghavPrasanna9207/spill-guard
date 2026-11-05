@@ -83,7 +83,7 @@ class Plan:
 
 
 def solve(demand, tier_values, base, deps=None, max_temps=None, fixed_temps=None,
-          penalty_scale=1.0, floor_cap=None, crowding=None):
+          penalty_scale=1.0, floor_cap=None, crowding=None, pack_cap=None):
     """Choose temps by start hour and wave assignment; with fixed_temps, only wave assignment.
 
     demand: [hour, state, tier] orders arriving each hour.
@@ -93,13 +93,16 @@ def solve(demand, tier_values, base, deps=None, max_temps=None, fixed_temps=None
         (default FLOOR_CAP_MULT x base).
     crowding: above this many on the floor, each extra temp adds CROWDED_RATE, not TEMP_RATE
         (default CROWDING_MULT x base).
+    pack_cap: most orders packed per wave, so most picked (default PACK_STATIONS_MULT x base
+        stations x PACK_RATE).
 
     Exact branch-and-bound took 20-60+ s per day even on this pooled model (CBC, SCIP,
     HiGHS), so whole-number temps come from the LP relaxation rounded up, then a clean-up
     that removes one temp at a time while total cost falls. `gap` reports the distance from
     the LP lower bound. One LP is built; temps are pinned by bounds, so re-solves are warm.
     """
-    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, max_temps, floor_cap, crowding)
+    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, max_temps, floor_cap, crowding,
+                 pack_cap)
     if fixed_temps is not None:
         lp.cost(np.asarray(fixed_temps, float))
         return lp.plan()
@@ -135,7 +138,7 @@ def solve(demand, tier_values, base, deps=None, max_temps=None, fixed_temps=None
 
 
 def frontier(demand, tier_values, base, points=15, deps=None, penalty_scale=1.0,
-             floor_cap=None, crowding=None):
+             floor_cap=None, crowding=None, pack_cap=None):
     """Plans along the labour-cost vs spill-cost curve, as the cap on total temp shifts rises
     from 0 to the unconstrained optimum (past it, extra temps cost more than they save).
 
@@ -143,7 +146,8 @@ def frontier(demand, tier_values, base, points=15, deps=None, penalty_scale=1.0,
     0.1 s a point; solve() per cap took ~1.3 s a point on 72h. Total cost can only fall as the
     cap rises. Whole-number plans from solve() sit within their `gap` (~1-2%) of this curve.
     """
-    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, floor_cap, crowding)
+    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, floor_cap, crowding,
+                 pack_cap)
     plans = []
     for cap in np.linspace(0, lp.relax().sum(), points):
         lp.limit.SetUb(cap)
@@ -155,9 +159,10 @@ def frontier(demand, tier_values, base, points=15, deps=None, penalty_scale=1.0,
 
 
 def wave_picks(demand, tier_values, base, temps, deps=None, penalty_scale=1.0, floor_cap=None,
-               crowding=None):
+               crowding=None, pack_cap=None):
     """Orders [wave, state, tier] the LP picks in each wave with temps fixed (rolling re-plan)."""
-    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, floor_cap, crowding)
+    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, floor_cap, crowding,
+                 pack_cap)
     lp.cost(temps)
     out = np.zeros((lp.W,) + demand.shape[1:])
     for s, v, w, _, x in lp.picks:
@@ -166,14 +171,15 @@ def wave_picks(demand, tier_values, base, temps, deps=None, penalty_scale=1.0, f
 
 
 def marginal_roi(demand, tier_values, base, temps, deps=None, penalty_scale=1.0, floor_cap=None,
-                 crowding=None):
+                 crowding=None, pack_cap=None):
     """What one more temp starting at each hour would cost and save, on top of `temps`.
 
     Exact: re-solves the fixed-headcount LP per start hour (re-running solve() would add its
     ~1-2% heuristic noise, about one temp's worth). Rows are NaN where the floor is already
     full during part of that shift, so the extra temp could not work.
     """
-    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, floor_cap, crowding)
+    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, floor_cap, crowding,
+                 pack_cap)
     temps = np.asarray(temps, float)
     lp.cost(temps)
     before = lp.plan()
@@ -198,11 +204,13 @@ class _WaveLP:
     """Wave-assignment LP with temps as variables; pin them via bounds to cost a plan."""
 
     def __init__(self, demand, tier_values, base, deps, penalty_scale, max_temps, floor_cap,
-                 crowding):
+                 crowding, pack_cap):
         floor_cap = self.floor_cap = cfg.FLOOR_CAP_MULT * base if floor_cap is None else floor_cap
         crowding = cfg.CROWDING_MULT * base if crowding is None else crowding
         if not base <= crowding <= floor_cap:
             raise ValueError("need base headcount <= crowding threshold <= floor cap")
+        if pack_cap is None:
+            pack_cap = cfg.PACK_STATIONS_MULT * base * cfg.PACK_RATE
         H, S, V = demand.shape
         W = self.W = H + LOOKAHEAD
         if deps is None:
@@ -214,7 +222,7 @@ class _WaveLP:
         h = self.h = [solver.NumVar(0, inf, f"h{t}") for t in range(H)]
         objective = solver.Objective()
         self.picks, self.leftover = _add_flows(
-            solver, objective, demand, deps, rate, base, h, W, floor_cap, crowding)
+            solver, objective, demand, deps, rate, base, h, W, floor_cap, crowding, pack_cap)
         for t in range(H):
             objective.SetCoefficient(h[t], shift_cost(t))
         limit = self.limit = solver.Constraint(0, inf if max_temps is None else max_temps)
@@ -267,7 +275,7 @@ def on_shift(temps, W):
     return np.convolve(temps, np.ones(cfg.SHIFT_HOURS))[:W]
 
 
-def _add_flows(solver, objective, demand, deps, rate, base, h, W, floor_cap, crowding):
+def _add_flows(solver, objective, demand, deps, rate, base, h, W, floor_cap, crowding, pack_cap):
     """Capacity rows per wave and one picking queue per (state, tier, target truck)."""
     H, S, V = demand.shape
     inf = solver.infinity()
@@ -288,6 +296,10 @@ def _add_flows(solver, objective, demand, deps, rate, base, h, W, floor_cap, cro
         c.SetCoefficient(calm, -cfg.TEMP_RATE)
         c.SetCoefficient(crowded, -cfg.CROWDED_RATE)
         cap.append(c)
+    # Packing: pickers cannot send more down to the pack stations than they can pack in a wave.
+    # ponytail: pack stations are fixed staff, not planned or costed; add packer shifts if
+    # packing binds often.
+    pack = [solver.Constraint(0, pack_cap) for _ in range(W)]
 
     picks = []    # (s, v, wave, delay_h, var)
     leftover = []  # (s, v, var) queue left at the end
@@ -312,6 +324,7 @@ def _add_flows(solver, objective, demand, deps, rate, base, h, W, floor_cap, cro
                     if queue is not None:
                         balance.SetCoefficient(queue, -1)
                     cap[w].SetCoefficient(x, 1)
+                    pack[w].SetCoefficient(x, 1)
                     delay = deps[s][truck[w]] - deps[s][i]
                     objective.SetCoefficient(x, delay * rate[v])
                     picks.append((s, v, w, delay, x))

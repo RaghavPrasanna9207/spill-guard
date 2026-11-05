@@ -25,6 +25,18 @@ def test_spill_accounting_matches_lp():
         assert plan.spill_cost == pytest.approx(lp.spill_cost) == pytest.approx(150)
 
 
+def test_packing_caps_simulated_picks():
+    demand = np.zeros((4, 1, 1))
+    demand[0, 0, 0] = 100
+    deps = [np.array([3.0, 27.0, 51.0, 75.0, 99.0, 123.0])]
+    temps = np.array([0, 1, 0, 0])  # picking 90 in wave 1, packing only 60
+    lp = model.solve(demand, VALUES, 1, deps=deps, fixed_temps=temps, pack_cap=60)
+    for policy in sim.POLICIES:
+        plan = run(demand, deps, policy, temps, pack_cap=60)
+        assert plan.spilled.sum() == pytest.approx(40)
+        assert plan.spill_cost == pytest.approx(lp.spill_cost)
+
+
 def test_earliest_truck_beats_fifo_when_trucks_differ():
     # 50 orders each for state A (truck 03:00) and B (truck 10:00) arrive together; one picker.
     # FIFO splits wave 1 evenly, so 25 A orders miss 03:00. Picking A first spills nothing.
