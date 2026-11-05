@@ -1,8 +1,10 @@
+import time
+
 import numpy as np
 import pytest
 
 from spillguard import config as cfg
-from spillguard import model
+from spillguard import data, model
 
 # Hand-sized case: 1 state, 1 tier, 100 orders arriving in hour 0, one permanent picker
 # (50/wave). Trucks at hours 3 and 27. Wave 1 is the earliest wave and catches the 03:00
@@ -61,6 +63,36 @@ def test_lp_with_milp_headcount_reproduces_milp():
     milp = solve(max_temps=1)
     lp = solve(fixed_temps=milp.temps)
     assert lp.spill_cost == pytest.approx(milp.spill_cost)
+
+
+def test_frontier_trades_labour_for_spill_linearly_on_hand_case():
+    # Each fractional temp in wave 1 saves 40 orders x R$15, more than its ~R$190, so the LP
+    # optimum hires 1.25 temps and clears all 50 excess orders; spill falls linearly to it.
+    plans = model.frontier(DEMAND, VALUES, base=1, deps=DEPS, points=6)
+    caps = [p.temps.sum() for p in plans]
+    assert caps == pytest.approx([0, 0.25, 0.5, 0.75, 1, 1.25])
+    for cap, p in zip(caps, plans):
+        assert p.spill_cost == pytest.approx(15 * (50 - 40 * cap))
+        assert p.labour_cost == pytest.approx(model.shift_cost(1) * cap)  # 01:00 start is cheapest
+
+
+@pytest.mark.skipif(not (data.RAW / "olist_orders_dataset.csv").exists(),
+                    reason="Olist CSVs not in data/raw")
+def test_frontier_on_black_friday():
+    orders = data.load_orders()
+    base = model.base_headcount(data.forecast_demand(orders))
+    demand = data.forecast_demand(orders, peak_surge=7.5, weekend_surge=3.3)  # ~hindsight surges
+    vals = data.tier_values(orders)
+    start = time.perf_counter()
+    plan = model.solve(demand, vals, base)
+    assert time.perf_counter() - start < 10
+    plans = model.frontier(demand, vals, base)
+    spill = [p.spill_cost for p in plans]
+    labour = [p.labour_cost for p in plans]
+    assert all(b <= a + 1e-6 for a, b in zip(spill, spill[1:]))
+    assert all(b >= a - 1e-6 for a, b in zip(labour, labour[1:]))
+    assert spill[0] == pytest.approx(model.solve(demand, vals, base, max_temps=0).spill_cost)
+    assert plans[-1].total_cost == pytest.approx(plan.lower_bound)
 
 
 def test_truck_schedule():

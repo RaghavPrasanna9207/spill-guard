@@ -87,7 +87,7 @@ def solve(demand, tier_values, base, deps=None, max_temps=None, fixed_temps=None
 
     demand: [hour, state, tier] orders arriving each hour.
     deps: departure-time arrays per state (defaults to the configured truck schedule).
-    max_temps: cap on total temp shifts, used for the frontier sweep.
+    max_temps: cap on total temp shifts.
     floor_cap: most pickers (permanent + temps) on the floor in any hour
         (default FLOOR_CAP_MULT x base).
     crowding: above this many on the floor, each extra temp adds CROWDED_RATE, not TEMP_RATE
@@ -98,10 +98,6 @@ def solve(demand, tier_values, base, deps=None, max_temps=None, fixed_temps=None
     that removes one temp at a time while total cost falls. `gap` reports the distance from
     the LP lower bound. One LP is built; temps are pinned by bounds, so re-solves are warm.
     """
-    floor_cap = cfg.FLOOR_CAP_MULT * base if floor_cap is None else floor_cap
-    crowding = cfg.CROWDING_MULT * base if crowding is None else crowding
-    if not base <= crowding <= floor_cap:
-        raise ValueError("need base headcount <= crowding threshold <= floor cap")
     lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, max_temps, floor_cap, crowding)
     if fixed_temps is not None:
         lp.cost(np.asarray(fixed_temps, float))
@@ -116,7 +112,7 @@ def solve(demand, tier_values, base, deps=None, max_temps=None, fixed_temps=None
             temps[t] = max(temps[t] - 1, 0)
     # Rounding up can overfill the floor; trim the most-rounded start hour covering each
     # overfull wave. Terminates: rounded-down temps never exceed the LP's, which fit.
-    while (over := np.flatnonzero(on_shift(temps, lp.W) > floor_cap - base + 1e-9)).size:
+    while (over := np.flatnonzero(on_shift(temps, lp.W) > lp.floor_cap - base + 1e-9)).size:
         w = over[0]
         window = np.arange(max(0, w - cfg.SHIFT_HOURS + 1), min(w, len(temps) - 1) + 1)
         temps[window[np.argmax((temps - frac)[window])]] -= 1
@@ -137,11 +133,35 @@ def solve(demand, tier_values, base, deps=None, max_temps=None, fixed_temps=None
     return plan
 
 
+def frontier(demand, tier_values, base, points=15, deps=None, penalty_scale=1.0,
+             floor_cap=None, crowding=None):
+    """Plans along the labour-cost vs spill-cost curve, as the cap on total temp shifts rises
+    from 0 to the unconstrained optimum (past it, extra temps cost more than they save).
+
+    Each point is the LP relaxation (fractional temps) of one model re-solved per cap, about
+    0.1 s a point; solve() per cap took ~1.3 s a point on 72h. Total cost can only fall as the
+    cap rises. Whole-number plans from solve() sit within their `gap` (~1-2%) of this curve.
+    """
+    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, floor_cap, crowding)
+    plans = []
+    for cap in np.linspace(0, lp.relax().sum(), points):
+        lp.limit.SetUb(cap)
+        lp.relax()
+        plan = lp.plan()
+        plan.lower_bound = plan.total_cost
+        plans.append(plan)
+    return plans
+
+
 class _WaveLP:
     """Wave-assignment LP with temps as variables; pin them via bounds to cost a plan."""
 
     def __init__(self, demand, tier_values, base, deps, penalty_scale, max_temps, floor_cap,
                  crowding):
+        floor_cap = self.floor_cap = cfg.FLOOR_CAP_MULT * base if floor_cap is None else floor_cap
+        crowding = cfg.CROWDING_MULT * base if crowding is None else crowding
+        if not base <= crowding <= floor_cap:
+            raise ValueError("need base headcount <= crowding threshold <= floor cap")
         H, S, V = demand.shape
         W = self.W = H + LOOKAHEAD
         if deps is None:
@@ -156,10 +176,9 @@ class _WaveLP:
             solver, objective, demand, deps, rate, base, h, W, floor_cap, crowding)
         for t in range(H):
             objective.SetCoefficient(h[t], shift_cost(t))
-        if max_temps is not None:
-            limit = solver.Constraint(0, max_temps)
-            for t in range(H):
-                limit.SetCoefficient(h[t], 1)
+        limit = self.limit = solver.Constraint(0, inf if max_temps is None else max_temps)
+        for t in range(H):
+            limit.SetCoefficient(h[t], 1)
         objective.SetMinimization()
 
     def _solve(self):
@@ -191,7 +210,7 @@ class _WaveLP:
         for s, v, q in self.leftover:
             spilled[s, v] += q.solution_value()
             spill_cost += q.solution_value() * BACKLOG_DELAY_H * self.rate[v]
-        temps = np.array([v.solution_value() for v in self.h]).round()
+        temps = np.array([v.solution_value() for v in self.h])  # whole when pinned by cost()
         return Plan(
             temps=temps,
             labour_cost=sum(shift_cost(t) * n for t, n in enumerate(temps)),
