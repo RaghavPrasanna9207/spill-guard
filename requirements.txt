@@ -2,5 +2,4 @@ openai==3.46.0
 ortools==9.15.6755
 pandas==3.1.1
 pytest==9.2.0
-simpy==4.1.2
 streamlit==1.66.1

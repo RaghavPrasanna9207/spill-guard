@@ -153,6 +153,17 @@ def frontier(demand, tier_values, base, points=15, deps=None, penalty_scale=1.0,
     return plans
 
 
+def wave_picks(demand, tier_values, base, temps, deps=None, penalty_scale=1.0, floor_cap=None,
+               crowding=None):
+    """Orders [wave, state, tier] the LP picks in each wave with temps fixed (rolling re-plan)."""
+    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, floor_cap, crowding)
+    lp.cost(temps)
+    out = np.zeros((lp.W,) + demand.shape[1:])
+    for s, v, w, _, x in lp.picks:
+        out[w, s, v] += x.solution_value()
+    return out
+
+
 class _WaveLP:
     """Wave-assignment LP with temps as variables; pin them via bounds to cost a plan."""
 
@@ -203,7 +214,7 @@ class _WaveLP:
         S, V = self.demand.shape[1:]
         spilled = np.zeros((S, V))
         spill_cost = 0.0
-        for s, v, delay, x in self.picks:
+        for s, v, _, delay, x in self.picks:
             if delay > 0:
                 spilled[s, v] += x.solution_value()
                 spill_cost += x.solution_value() * delay * self.rate[v]
@@ -248,7 +259,7 @@ def _add_flows(solver, objective, demand, deps, rate, base, h, W, floor_cap, cro
         c.SetCoefficient(crowded, -cfg.CROWDED_RATE)
         cap.append(c)
 
-    picks = []    # (s, v, delay_h, var)
+    picks = []    # (s, v, wave, delay_h, var)
     leftover = []  # (s, v, var) queue left at the end
     for s in range(S):
         # truck[w]: index of the departure caught by wave w
@@ -273,7 +284,7 @@ def _add_flows(solver, objective, demand, deps, rate, base, h, W, floor_cap, cro
                     cap[w].SetCoefficient(x, 1)
                     delay = deps[s][truck[w]] - deps[s][i]
                     objective.SetCoefficient(x, delay * rate[v])
-                    picks.append((s, v, delay, x))
+                    picks.append((s, v, w, delay, x))
                     queue = q
                 objective.SetCoefficient(queue, BACKLOG_DELAY_H * rate[v])
                 leftover.append((s, v, queue))

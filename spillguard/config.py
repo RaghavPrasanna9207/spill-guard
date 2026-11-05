@@ -55,6 +55,10 @@ EMPLOYER_COST_MULT = 1.8         # ASSUMPTION: payroll charges + agency fee on t
 NIGHT_PREMIUM = 0.20             # CLT art. 73: +20% for hours worked 22:00-05:00
 # ponytail: ignores the shorter 52.5-min legal night hour.
 
+# Simulation noise (sim.py)
+PICK_SPEED_SD = 0.10             # ASSUMPTION: hour-to-hour spread of the floor's pick rate
+ABSENT_PROB = 0.05               # ASSUMPTION: chance a rostered picker is missing in a given hour
+
 # --- Spill penalty -----------------------------------------------------------
 SUPPORT_COST_PER_DAY_LATE = 10.0  # ASSUMPTION: R$ per order per day late (contacts, vouchers)
 CANCEL_PROB_PER_DAY_LATE = 0.05   # ASSUMPTION: chance a late order is cancelled, per day late
