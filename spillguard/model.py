@@ -48,6 +48,12 @@ def shift_cost(start):
     return day_rate * (1 + cfg.NIGHT_PREMIUM * night / cfg.SHIFT_HOURS)
 
 
+def overtime_cost(wave):
+    """R$ per permanent picker-hour of overtime in `wave`, with the night premium."""
+    hourly = cfg.PERM_MONTHLY_WAGE / cfg.CLT_MONTHLY_HOURS * cfg.PERM_COST_MULT
+    return hourly * (1 + cfg.OVERTIME_PREMIUM) * (1 + cfg.NIGHT_PREMIUM * (wave % 24 in NIGHT_HOURS))
+
+
 def delay_cost_per_hour(tier_values, penalty_scale=1.0):
     """R$ per order per hour late, by tier: support cost + value x cancellation chance."""
     per_day = cfg.SUPPORT_COST_PER_DAY_LATE + np.asarray(tier_values) * cfg.CANCEL_PROB_PER_DAY_LATE
@@ -62,12 +68,13 @@ def base_headcount(normal_demand):
 @dataclass
 class Plan:
     temps: np.ndarray      # temps starting at each hour
-    labour_cost: float     # R$, temps only (permanent staff are a sunk cost)
+    labour_cost: float     # R$, temps and overtime (permanent base pay is a sunk cost)
     spill_cost: float      # R$
     spilled: np.ndarray    # [state, tier] orders that missed their target truck
     backlog: float         # orders still queued at the end of the lookahead
     demand_total: float
     lower_bound: float = math.nan  # LP-relaxation cost; no whole-number plan can beat it
+    overtime: np.ndarray = None    # permanent overtime picker-hours in each wave
 
     @property
     def gap(self):
@@ -84,7 +91,7 @@ class Plan:
 
 
 def resolve_limits(base, floor_cap=None, crowding=None, pack_cap=None, agency_daily=None,
-                   agency_night=None):
+                   agency_night=None, overtime_daily=None):
     """Floor and supply limits; unset ones default to config multiples of `base`.
 
     floor_cap: most pickers (permanent + temps) on the floor in any hour
@@ -97,6 +104,8 @@ def resolve_limits(base, floor_cap=None, crowding=None, pack_cap=None, agency_da
         AGENCY_DAILY_MULT x base).
     agency_night: most of those starting in night hours, 22:00-04:00 (default
         AGENCY_NIGHT_MULT x base).
+    overtime_daily: most permanent overtime picker-hours per window day (default
+        OVERTIME_MAX_H for each of the base x 24/SHIFT_HOURS permanent pickers; 0 turns it off).
     """
     floor_cap = cfg.FLOOR_CAP_MULT * base if floor_cap is None else floor_cap
     crowding = cfg.CROWDING_MULT * base if crowding is None else crowding
@@ -106,8 +115,11 @@ def resolve_limits(base, floor_cap=None, crowding=None, pack_cap=None, agency_da
         pack_cap = cfg.PACK_STATIONS_MULT * base * cfg.PACK_RATE
     agency_daily = cfg.AGENCY_DAILY_MULT * base if agency_daily is None else agency_daily
     agency_night = cfg.AGENCY_NIGHT_MULT * base if agency_night is None else agency_night
+    if overtime_daily is None:
+        overtime_daily = cfg.OVERTIME_MAX_H * base * 24 / cfg.SHIFT_HOURS
     return SimpleNamespace(floor_cap=floor_cap, crowding=crowding, pack_cap=pack_cap,
-                           agency_daily=agency_daily, agency_night=agency_night)
+                           agency_daily=agency_daily, agency_night=agency_night,
+                           overtime_daily=overtime_daily)
 
 
 def solve(demand, tier_values, base, deps=None, max_temps=None, fixed_temps=None,
@@ -194,10 +206,12 @@ def frontier(demand, tier_values, base, points=15, deps=None, penalty_scale=1.0,
     return plans
 
 
-def wave_picks(demand, tier_values, base, temps, deps=None, penalty_scale=1.0, **limits):
-    """Orders [wave, state, tier] the LP picks in each wave with temps fixed (rolling re-plan)."""
+def wave_picks(demand, tier_values, base, temps, overtime, deps=None, penalty_scale=1.0,
+               **limits):
+    """Orders [wave, state, tier] the LP picks in each wave with temps and overtime fixed
+    (rolling re-plan). overtime: picker-hours per wave, padded with zeros to the LP's waves."""
     lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, limits)
-    lp.cost(temps)
+    lp.cost(temps, np.pad(overtime, (0, lp.W - len(overtime))))
     out = np.zeros((lp.W,) + demand.shape[1:])
     for s, v, w, _, x in lp.picks:
         out[w, s, v] += x.solution_value()
@@ -247,8 +261,12 @@ class _WaveLP:
         inf = solver.infinity()
         h = self.h = [solver.NumVar(0, inf, f"h{t}") for t in range(H)]
         objective = solver.Objective()
-        self.picks, self.leftover = _add_flows(
+        self.picks, self.leftover, self.o = _add_flows(
             solver, objective, demand, deps, rate, base, h, W, lim)
+        for day in range(0, W, 24):  # overtime hours per day, all permanent pickers together
+            c = solver.Constraint(0, lim.overtime_daily)
+            for w in range(day, min(day + 24, W)):
+                c.SetCoefficient(self.o[w], 1)
         for t in range(H):
             objective.SetCoefficient(h[t], shift_cost(t))
         limit = self.limit = solver.Constraint(0, inf if max_temps is None else max_temps)
@@ -290,10 +308,13 @@ class _WaveLP:
         self._solve()
         return np.array([v.solution_value() for v in self.h])
 
-    def cost(self, temps):
-        """Total cost (R$) with temps pinned to `temps`."""
+    def cost(self, temps, overtime=None):
+        """Total cost (R$) with temps pinned to `temps`; overtime too if given, else optimised."""
         for v, n in zip(self.h, temps):
             v.SetBounds(n, n)
+        if overtime is not None:
+            for v, n in zip(self.o, overtime):
+                v.SetBounds(n, n)
         return self._solve()
 
     def plan(self):
@@ -308,9 +329,12 @@ class _WaveLP:
             spilled[s, v] += q.solution_value()
             spill_cost += q.solution_value() * BACKLOG_DELAY_H * self.rate[v]
         temps = np.array([v.solution_value() for v in self.h])  # whole when pinned by cost()
+        overtime = np.array([v.solution_value() for v in self.o])
         return Plan(
             temps=temps,
-            labour_cost=sum(shift_cost(t) * n for t, n in enumerate(temps)),
+            overtime=overtime,
+            labour_cost=sum(shift_cost(t) * n for t, n in enumerate(temps))
+            + sum(overtime_cost(w) * n for w, n in enumerate(overtime)),
             spill_cost=spill_cost,
             spilled=spilled,
             backlog=sum(q.solution_value() for _, _, q in self.leftover),
@@ -331,19 +355,28 @@ def _add_flows(solver, objective, demand, deps, rate, base, h, W, lim):
     # the crowding threshold, TEMP_RATE each) and "crowded" temps (CROWDED_RATE each, up to
     # the floor cap). Calm slots give more capacity for the same cost, so the LP fills them
     # first; that makes capacity concave in headcount without integer variables.
-    cap = []
+    # Permanent pickers on overtime take slots like temps and add the experience gap
+    # (PERM_RATE - TEMP_RATE) on top of the slot's rate.
+    # ponytail: an overtime picker in a crowded slot picks 35/h, not a slowed-down 50; split
+    # overtime into its own calm/crowded slots if overtime often lands above the threshold.
+    cap, overtime = [], []
     for w in range(W):
         calm = solver.NumVar(0, lim.crowding - base, "")
         crowded = solver.NumVar(0, lim.floor_cap - lim.crowding, "")
-        split = solver.Constraint(0, 0)  # calm + crowded = temps on shift
+        o = solver.NumVar(0, base, "")  # only the crew on hand can stay late
+        split = solver.Constraint(0, 0)  # calm + crowded = temps on shift + overtime pickers
         split.SetCoefficient(calm, 1)
         split.SetCoefficient(crowded, 1)
+        split.SetCoefficient(o, -1)
         for t in range(max(0, w - cfg.SHIFT_HOURS + 1), min(w, H - 1) + 1):
             split.SetCoefficient(h[t], -1)
         c = solver.Constraint(-inf, cfg.PERM_RATE * base)
         c.SetCoefficient(calm, -cfg.TEMP_RATE)
         c.SetCoefficient(crowded, -cfg.CROWDED_RATE)
+        c.SetCoefficient(o, -(cfg.PERM_RATE - cfg.TEMP_RATE))
+        objective.SetCoefficient(o, overtime_cost(w))
         cap.append(c)
+        overtime.append(o)
     # Packing: pickers cannot send more down to the pack stations than they can pack in a wave.
     # ponytail: pack stations are fixed staff, not planned or costed; add packer shifts if
     # packing binds often.
@@ -379,4 +412,4 @@ def _add_flows(solver, objective, demand, deps, rate, base, h, W, lim):
                     queue = q
                 objective.SetCoefficient(queue, BACKLOG_DELAY_H * rate[v])
                 leftover.append((s, v, queue))
-    return picks, leftover
+    return picks, leftover, overtime

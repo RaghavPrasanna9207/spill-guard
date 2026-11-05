@@ -18,7 +18,7 @@ def test_spill_accounting_matches_lp():
     demand[0, 0, 0] = 100
     deps = [np.array([3.0, 27.0, 51.0, 75.0, 99.0, 123.0])]
     temps = np.array([0, 1, 0, 0])
-    lp = model.solve(demand, VALUES, 1, deps=deps, fixed_temps=temps)
+    lp = model.solve(demand, VALUES, 1, deps=deps, fixed_temps=temps, overtime_daily=0)
     for policy in sim.POLICIES:
         plan = run(demand, deps, policy, temps)
         assert plan.spilled.sum() == pytest.approx(10)
@@ -30,11 +30,25 @@ def test_packing_caps_simulated_picks():
     demand[0, 0, 0] = 100
     deps = [np.array([3.0, 27.0, 51.0, 75.0, 99.0, 123.0])]
     temps = np.array([0, 1, 0, 0])  # picking 90 in wave 1, packing only 60
-    lp = model.solve(demand, VALUES, 1, deps=deps, fixed_temps=temps, pack_cap=60)
+    lp = model.solve(demand, VALUES, 1, deps=deps, fixed_temps=temps, pack_cap=60,
+                     overtime_daily=0)
     for policy in sim.POLICIES:
         plan = run(demand, deps, policy, temps, pack_cap=60)
         assert plan.spilled.sum() == pytest.approx(40)
         assert plan.spill_cost == pytest.approx(lp.spill_cost)
+
+
+def test_sim_uses_planned_overtime():
+    # The plan covers the 50 excess orders with one overtime hour; every policy gets it.
+    demand = np.zeros((4, 1, 1))
+    demand[0, 0, 0] = 100
+    deps = [np.array([3.0, 27.0, 51.0, 75.0, 99.0, 123.0])]
+    plan = model.solve(demand, VALUES, 1, deps=deps, max_temps=0)
+    assert plan.overtime.sum() == pytest.approx(1)
+    for policy in sim.POLICIES:
+        out = run(demand, deps, policy, plan.temps, overtime=plan.overtime)
+        assert out.spilled.sum() == pytest.approx(0)
+        assert out.labour_cost == pytest.approx(plan.labour_cost)
 
 
 def test_earliest_truck_beats_fifo_when_trucks_differ():
@@ -56,7 +70,8 @@ def test_replan_reproduces_lp_on_black_friday():
     actual, vals = data.actual_demand(orders), data.tier_values(orders)
     plan = model.solve(actual, vals, base)
     # Noise off and a perfect forecast: re-planning must land on the day-before plan's cost.
-    replan = sim.run(actual, actual, vals, base, plan.temps, "replan", noise=False)
+    replan = sim.run(actual, actual, vals, base, plan.temps, "replan", noise=False,
+                     overtime=plan.overtime)
     assert replan.spill_cost == pytest.approx(plan.spill_cost, rel=0.01)
     # With noise, every policy sees the same draws for a seed.
     a, b = (sim.run(actual, actual, vals, base, plan.temps, p, seed=3)

@@ -15,9 +15,9 @@ DEPS = [np.array([3.0, 27.0, 51.0, 75.0, 99.0, 123.0])]
 VALUES = [100.0]  # R$ per order -> 10 + 100 x 0.05 = R$15 per day late
 
 
-# All four hand-case start hours are night hours and base=1 gives a 1.5 night cap, so agency
-# caps are off here unless a test sets them.
-HAND = dict(deps=DEPS, agency_daily=99, agency_night=99)
+# All four hand-case start hours are night hours and base=1 gives a 1.5 night cap, and the
+# hand case is about temps, so agency caps and overtime are off here unless a test sets them.
+HAND = dict(deps=DEPS, agency_daily=99, agency_night=99, overtime_daily=0)
 
 
 def solve(**kw):
@@ -113,6 +113,22 @@ def test_marginal_roi_skips_hours_the_agency_cannot_fill():
     assert roi.net.isna().all()
 
 
+def test_overtime_covers_a_short_peak_more_cheaply_than_a_temp():
+    # The permanent picker staying one extra hour in wave 1 takes a slot (40/h) plus the
+    # experience gap (10/h): exactly the 50 excess orders, for ~R$29 instead of a ~R$190 shift.
+    plan = solve(overtime_daily=6)
+    assert plan.temps.sum() == 0
+    assert plan.overtime.sum() == pytest.approx(1)
+    assert plan.spilled.sum() == pytest.approx(0)
+    assert plan.labour_cost == pytest.approx(model.overtime_cost(1))
+
+
+def test_overtime_daily_cap_limits_it():
+    # Half an hour of overtime picks 25 of the 50 excess orders; no temps allowed.
+    plan = solve(overtime_daily=0.5, max_temps=0)
+    assert plan.spilled.sum() == pytest.approx(25)
+
+
 needs_olist = pytest.mark.skipif(not (data.RAW / "olist_orders_dataset.csv").exists(),
                                  reason="Olist CSVs not in data/raw")
 
@@ -144,10 +160,13 @@ def test_marginal_roi_skips_hours_with_a_full_floor():
 @needs_olist
 def test_marginal_roi_matches_frontier_slope():
     # Best extra temp's net saving ~ the drop in the LP bound from one more allowed temp.
+    # Overtime off: as a continuous lever it absorbs fractional capacity differently in the
+    # whole-temp plan and the LP, which moves the two up to ~5% apart at some caps.
     demand, vals, base = black_friday()
-    plan = model.solve(demand, vals, base, max_temps=50)
-    roi = model.marginal_roi(demand, vals, base, plan.temps)
-    slope = plan.lower_bound - model.solve(demand, vals, base, max_temps=51).lower_bound
+    kw = dict(overtime_daily=0)
+    plan = model.solve(demand, vals, base, max_temps=50, **kw)
+    roi = model.marginal_roi(demand, vals, base, plan.temps, **kw)
+    slope = plan.lower_bound - model.solve(demand, vals, base, max_temps=51, **kw).lower_bound
     assert roi.net.max() == pytest.approx(slope, rel=0.05)
     assert roi.net.isna().any()  # Black Friday's peak fills the floor
 

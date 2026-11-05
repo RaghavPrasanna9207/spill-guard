@@ -48,6 +48,13 @@ SHIFT_HOURS = 8
 FLOOR_CAP_MULT = 4               # ASSUMPTION: floor holds 4x the permanent headcount
 CROWDING_MULT = 3                # ASSUMPTION: aisles congest above 3x (75% of the floor)
 CROWDED_RATE = 25                # ASSUMPTION: orders/h added by each picker above the threshold
+# Overtime for permanent pickers.
+PERM_MONTHLY_WAGE = 2086         # R$, Indeed median, separador de mercadorias, SP (57 salaries)
+CLT_MONTHLY_HOURS = 220          # CLT hourly divisor for a 44-hour week
+PERM_COST_MULT = 1.7             # employer charges on CLT pay: 1.7-2.0x under Lucro Real/Presumido
+                                 # (Valor Final, Cora); low end, benefits do not scale with overtime
+OVERTIME_PREMIUM = 0.50          # Constitution art. 7 XVI: at least 50% above the normal hour
+OVERTIME_MAX_H = 2               # CLT art. 59: at most 2 extra hours per person per day
 # Agency supply. Temps come from an agency that can only fill so many shifts a day, and
 # fewer at night. Scaled with permanent headcount like the floor cap: 30/day, 6 at night.
 AGENCY_DAILY_MULT = 7.5          # ASSUMPTION: temp shift starts per day the agency can fill

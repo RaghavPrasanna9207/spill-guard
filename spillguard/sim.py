@@ -15,7 +15,7 @@ POLICIES = ("fifo", "earliest_truck", "replan")
 
 
 def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, replan_every=2,
-        penalty_scale=1.0, deps=None, **limits):
+        penalty_scale=1.0, deps=None, overtime=None, **limits):
     """Simulate one realisation; returns a model.Plan of what actually happened.
 
     forecast: [hour, state, tier] demand the re-plan expects for hours not yet seen.
@@ -25,11 +25,16 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
         70% of it building), so hourly runs take ~12 s on 72h; every 2 h costs ~1% more
         spill. Upgrade: build the LP once and update the backlog right-hand sides.
     deps: departure-time arrays per state (defaults to the configured truck schedule).
+    overtime: planned permanent overtime picker-hours per wave (Plan.overtime), fixed for every
+        policy like temps; not hit by absence, since those pickers are already on shift.
     limits: floor_cap, crowding, pack_cap, as for model.solve.
     """
     H, S, V = actual.shape
     W = H + model.LOOKAHEAD
     temps = np.asarray(temps, float)
+    ot = np.zeros(W)
+    if overtime is not None:
+        ot[:min(W, len(overtime))] = overtime[:W]
     lim = model.resolve_limits(base, **limits)
     rate = model.delay_cost_per_hour(tier_values, penalty_scale)
     if deps is None:
@@ -49,9 +54,10 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
         speed = np.maximum(rng.normal(1, cfg.PICK_SPEED_SD, W), 0)
     else:
         arrivals, perm, temp, speed = actual.astype(float), np.full(W, base), on, np.ones(W)
-    calm = np.minimum(temp, lim.crowding - base)
+    slots = temp + ot  # overtime pickers take floor slots like temps, as in the LP
+    calm = np.minimum(slots, lim.crowding - base)
     picking = speed * (cfg.PERM_RATE * perm + cfg.TEMP_RATE * calm
-                       + cfg.CROWDED_RATE * (temp - calm))
+                       + cfg.CROWDED_RATE * (slots - calm) + (cfg.PERM_RATE - cfg.TEMP_RATE) * ot)
     capacity = np.minimum(picking, lim.pack_cap)
 
     hours = np.arange(H)
@@ -71,7 +77,7 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
             picked = _take(rem, cap, earliest_truck)
         elif policy == "replan":
             if (w - 1) % replan_every == 0:
-                planned = _replan(rem, forecast, w, tier_values, base, temps, deps,
+                planned = _replan(rem, forecast, w, tier_values, base, temps, ot, deps,
                                   penalty_scale, limits)
             picked = _oldest_first(rem, planned[w])
             if picked.sum() > cap:  # fewer pickers turned up than the LP assumed
@@ -87,7 +93,9 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
     cost += (rem.sum((0, 1)) * rate).sum() * model.BACKLOG_DELAY_H
     return model.Plan(
         temps=temps,
-        labour_cost=sum(model.shift_cost(t) * n for t, n in enumerate(temps)),
+        overtime=ot,
+        labour_cost=sum(model.shift_cost(t) * n for t, n in enumerate(temps))
+        + sum(model.overtime_cost(w) * n for w, n in enumerate(ot)),
         spill_cost=cost,
         spilled=spilled,
         backlog=rem.sum(),
@@ -111,7 +119,7 @@ def _mean_ci(xs):
     return xs.mean(), 1.96 * xs.std(ddof=1) / np.sqrt(len(xs))
 
 
-def _replan(rem, forecast, w, tier_values, base, temps, deps, penalty_scale, limits):
+def _replan(rem, forecast, w, tier_values, base, temps, overtime, deps, penalty_scale, limits):
     """LP picks per wave from wave w on, with the real backlog and the forecast for later hours.
 
     The backlog enters as orders that arrived in hour w-1. That is exact for decisions: any
@@ -125,8 +133,8 @@ def _replan(rem, forecast, w, tier_values, base, temps, deps, penalty_scale, lim
     demand[w - 1] = rem.sum(0)
     t = np.zeros(n)
     t[:H] = temps
-    return model.wave_picks(demand, tier_values, base, t, deps=deps, penalty_scale=penalty_scale,
-                            **limits)
+    return model.wave_picks(demand, tier_values, base, t, overtime, deps=deps,
+                            penalty_scale=penalty_scale, **limits)
 
 
 def _take(rem, cap, key):
