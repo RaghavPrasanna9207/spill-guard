@@ -2,8 +2,11 @@
 
 Time is in hours from the window start. Wave w runs [w, w+1); an order arriving during hour a
 can be picked from wave a+1 on, and catches the first truck leaving at or after
-w + 1 + LOADING_BUFFER_H. Delay is priced per hour behind the truck its earliest wave
-would have caught.
+w + 1 + LOADING_BUFFER_H. Its target truck is the one its earliest wave would catch.
+
+Orders are pooled into one queue per (state, tier, target truck): once they share a target,
+their arrival hour no longer matters. Pickers drain queues wave by wave; delay is priced per
+hour between the truck an order actually catches and its target.
 """
 import math
 from dataclasses import dataclass
@@ -13,8 +16,8 @@ from ortools.linear_solver import pywraplp
 
 from spillguard import config as cfg
 
-# ponytail: orders not picked within LOOKAHEAD waves go to a backlog at a flat delay;
-# raise it if backlog shows up in results.
+# ponytail: orders still queued LOOKAHEAD waves after their last arrival go to a backlog at
+# a flat delay; raise it if backlog shows up in results.
 LOOKAHEAD = 36
 BACKLOG_DELAY_H = LOOKAHEAD + 24
 NIGHT_HOURS = {22, 23, 0, 1, 2, 3, 4}  # CLT art. 73 night period 22:00-05:00
@@ -34,11 +37,6 @@ def departures(state, hours):
     first = (cfg.HUB_ARRIVAL_HOUR - km / cfg.TRUCK_KMH) % 24
     daily = [first, (first + 12) % 24] if km < cfg.TWO_TRUCKS_UNDER_KM else [first]
     return np.sort([d + 24 * k for k in range(math.ceil(hours / 24) + 1) for d in daily])
-
-
-def caught(deps, wave):
-    """Departure time caught by orders picked in `wave`."""
-    return deps[np.searchsorted(deps, wave + 1 + cfg.LOADING_BUFFER_H)]
 
 
 def shift_cost(start):
@@ -64,8 +62,8 @@ class Plan:
     temps: np.ndarray      # temps starting at each hour
     labour_cost: float     # R$, temps only (permanent staff are a sunk cost)
     spill_cost: float      # R$
-    spilled: np.ndarray    # [hour, state, tier] orders that missed their earliest truck
-    backlog: float         # orders not picked within LOOKAHEAD waves
+    spilled: np.ndarray    # [state, tier] orders that missed their target truck
+    backlog: float         # orders still queued at the end of the lookahead
     demand_total: float
     lower_bound: float = math.nan  # LP-relaxation cost; no whole-number plan can beat it
 
@@ -84,107 +82,180 @@ class Plan:
 
 
 def solve(demand, tier_values, base, deps=None, max_temps=None, fixed_temps=None,
-          penalty_scale=1.0):
+          penalty_scale=1.0, floor_cap=None, crowding=None):
     """Choose temps by start hour and wave assignment; with fixed_temps, only wave assignment.
 
     demand: [hour, state, tier] orders arriving each hour.
     deps: departure-time arrays per state (defaults to the configured truck schedule).
     max_temps: cap on total temp shifts, used for the frontier sweep.
+    floor_cap: most pickers (permanent + temps) on the floor in any hour
+        (default FLOOR_CAP_MULT x base).
+    crowding: above this many on the floor, each extra temp adds CROWDED_RATE, not TEMP_RATE
+        (default CROWDING_MULT x base).
 
-    The staffing MILP is solved by LP relaxation + rounding up, then an LP re-solve with the
-    rounded temps fixed. Exact branch-and-bound took 25-60 s for one day (CBC, SCIP, HiGHS);
-    this takes well under a second and reports its distance from the LP bound in `gap`.
+    Exact branch-and-bound took 20-60+ s per day even on this pooled model (CBC, SCIP,
+    HiGHS), so whole-number temps come from the LP relaxation rounded up, then a clean-up
+    that removes one temp at a time while total cost falls. `gap` reports the distance from
+    the LP lower bound. One LP is built; temps are pinned by bounds, so re-solves are warm.
     """
-    args = (demand, tier_values, base, deps, penalty_scale)
+    floor_cap = cfg.FLOOR_CAP_MULT * base if floor_cap is None else floor_cap
+    crowding = cfg.CROWDING_MULT * base if crowding is None else crowding
+    if not base <= crowding <= floor_cap:
+        raise ValueError("need base headcount <= crowding threshold <= floor cap")
+    lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, max_temps, floor_cap, crowding)
     if fixed_temps is not None:
-        return _lp(*args, temps=np.asarray(fixed_temps, float))
-    relaxed = _lp(*args, max_temps=max_temps)
-    frac = relaxed.temps
-    # Two roundings, keep the cheaper plan. Rounding each hour up never loses capacity but
-    # overshoots by up to one person per start hour. Rounding the running total keeps the
-    # total, and every 8h window, within one person of the LP.
-    up = np.ceil(frac - 1e-6)
+        lp.cost(np.asarray(fixed_temps, float))
+        return lp.plan()
+    frac = lp.relax()
+    bound = lp.solver.Objective().Value()
+    temps = np.ceil(frac - 1e-6)
     if max_temps is not None:  # trim the most-rounded hours first
-        for t in np.argsort(frac - up):
-            if up.sum() <= max_temps:
+        for t in np.argsort(frac - temps):
+            if temps.sum() <= max_temps:
                 break
-            up[t] = max(up[t] - 1, 0)
-    running = np.diff(np.ceil(np.cumsum(frac) - 1e-6), prepend=0)
-    # ponytail: no local search after rounding; add one if `gap` gets large.
-    plan = min((_lp(*args, temps=t) for t in (up, running)), key=lambda p: p.total_cost)
-    plan.lower_bound = relaxed.total_cost
+            temps[t] = max(temps[t] - 1, 0)
+    # Rounding up can overfill the floor; trim the most-rounded start hour covering each
+    # overfull wave. Terminates: rounded-down temps never exceed the LP's, which fit.
+    while (over := np.flatnonzero(on_shift(temps, lp.W) > floor_cap - base + 1e-9)).size:
+        w = over[0]
+        window = np.arange(max(0, w - cfg.SHIFT_HOURS + 1), min(w, len(temps) - 1) + 1)
+        temps[window[np.argmax((temps - frac)[window])]] -= 1
+    best = lp.cost(temps)
+    improved = True
+    while improved:  # ponytail: removal moves only; add swaps if `gap` gets large
+        improved = False
+        for t in np.flatnonzero(temps):
+            temps[t] -= 1
+            c = lp.cost(temps)
+            if c < best - 1e-6:
+                best, improved = c, True
+            else:
+                temps[t] += 1
+    lp.cost(temps)
+    plan = lp.plan()
+    plan.lower_bound = bound
     return plan
 
 
-def _lp(demand, tier_values, base, deps, penalty_scale, temps=None, max_temps=None):
-    """One LP: wave assignment with temps fixed, or with temps as continuous variables."""
-    H, S, V = demand.shape
-    W = H + LOOKAHEAD
-    if deps is None:
-        deps = [departures(s, W + BACKLOG_DELAY_H + 48) for s in cfg.DEST_STATES]
-    rate = delay_cost_per_hour(tier_values, penalty_scale)
+class _WaveLP:
+    """Wave-assignment LP with temps as variables; pin them via bounds to cost a plan."""
 
-    solver = pywraplp.Solver.CreateSolver("GLOP")
-    inf = solver.infinity()
-    fixed = temps is not None
-    h = list(temps) if fixed else [solver.NumVar(0, inf, f"h{t}") for t in range(H)]
-    objective = solver.Objective()
-
-    # Capacity per wave: permanent + temps whose 8h shift covers it.
-    cap = []
-    for w in range(W):
-        on_shift = range(max(0, w - cfg.SHIFT_HOURS + 1), min(w, H - 1) + 1)
-        ub = cfg.PERM_RATE * base + (cfg.TEMP_RATE * sum(h[t] for t in on_shift) if fixed else 0)
-        c = solver.Constraint(-inf, ub)
-        if not fixed:
-            for t in on_shift:
-                c.SetCoefficient(h[t], -cfg.TEMP_RATE)
-        cap.append(c)
-
-    flows = []  # (a, s, v, delay_h, var)
-    backlog = {}
-    for a, s, v in zip(*np.nonzero(demand)):
-        ideal = caught(deps[s], a + 1)
-        row = solver.Constraint(demand[a, s, v], demand[a, s, v])
-        for w in range(a + 1, min(a + 1 + LOOKAHEAD, W)):
-            x = solver.NumVar(0, inf, "")
-            delay = caught(deps[s], w) - ideal
-            row.SetCoefficient(x, 1)
-            cap[w].SetCoefficient(x, 1)
-            objective.SetCoefficient(x, delay * rate[v])
-            flows.append((a, s, v, delay, x))
-        b = solver.NumVar(0, inf, "")
-        row.SetCoefficient(b, 1)
-        objective.SetCoefficient(b, BACKLOG_DELAY_H * rate[v])
-        backlog[a, s, v] = b
-
-    if not fixed:
+    def __init__(self, demand, tier_values, base, deps, penalty_scale, max_temps, floor_cap,
+                 crowding):
+        H, S, V = demand.shape
+        W = self.W = H + LOOKAHEAD
+        if deps is None:
+            deps = [departures(s, W + BACKLOG_DELAY_H + 48) for s in cfg.DEST_STATES]
+        rate = delay_cost_per_hour(tier_values, penalty_scale)
+        self.demand, self.rate = demand, rate
+        solver = self.solver = pywraplp.Solver.CreateSolver("GLOP")
+        inf = solver.infinity()
+        h = self.h = [solver.NumVar(0, inf, f"h{t}") for t in range(H)]
+        objective = solver.Objective()
+        self.picks, self.leftover = _add_flows(
+            solver, objective, demand, deps, rate, base, h, W, floor_cap, crowding)
         for t in range(H):
             objective.SetCoefficient(h[t], shift_cost(t))
         if max_temps is not None:
             limit = solver.Constraint(0, max_temps)
             for t in range(H):
                 limit.SetCoefficient(h[t], 1)
-    objective.SetMinimization()
+        objective.SetMinimization()
 
-    if solver.Solve() != pywraplp.Solver.OPTIMAL:
-        raise RuntimeError("solver did not reach an optimal solution")
+    def _solve(self):
+        if self.solver.Solve() != pywraplp.Solver.OPTIMAL:
+            raise RuntimeError("solver did not reach an optimal solution")
+        return self.solver.Objective().Value()
 
-    temps = np.array([t if fixed else t.solution_value() for t in h])
-    spilled = np.zeros_like(demand, dtype=float)
-    spill_cost = 0.0
-    for a, s, v, delay, x in flows:
-        if delay > 0:
-            spilled[a, s, v] += x.solution_value()
-            spill_cost += x.solution_value() * delay * rate[v]
-    for (a, s, v), b in backlog.items():
-        spilled[a, s, v] += b.solution_value()
-        spill_cost += b.solution_value() * BACKLOG_DELAY_H * rate[v]
-    return Plan(
-        temps=temps,
-        labour_cost=sum(shift_cost(t) * n for t, n in enumerate(temps)),
-        spill_cost=spill_cost,
-        spilled=spilled,
-        backlog=sum(b.solution_value() for b in backlog.values()),
-        demand_total=float(demand.sum()),
-    )
+    def relax(self):
+        """Solve with fractional temps allowed; returns them."""
+        for v in self.h:
+            v.SetBounds(0, self.solver.infinity())
+        self._solve()
+        return np.array([v.solution_value() for v in self.h])
+
+    def cost(self, temps):
+        """Total cost (R$) with temps pinned to `temps`."""
+        for v, n in zip(self.h, temps):
+            v.SetBounds(n, n)
+        return self._solve()
+
+    def plan(self):
+        S, V = self.demand.shape[1:]
+        spilled = np.zeros((S, V))
+        spill_cost = 0.0
+        for s, v, delay, x in self.picks:
+            if delay > 0:
+                spilled[s, v] += x.solution_value()
+                spill_cost += x.solution_value() * delay * self.rate[v]
+        for s, v, q in self.leftover:
+            spilled[s, v] += q.solution_value()
+            spill_cost += q.solution_value() * BACKLOG_DELAY_H * self.rate[v]
+        temps = np.array([v.solution_value() for v in self.h]).round()
+        return Plan(
+            temps=temps,
+            labour_cost=sum(shift_cost(t) * n for t, n in enumerate(temps)),
+            spill_cost=spill_cost,
+            spilled=spilled,
+            backlog=sum(q.solution_value() for _, _, q in self.leftover),
+            demand_total=float(self.demand.sum()),
+        )
+
+
+def on_shift(temps, W):
+    """Temps on the floor in each of W waves (each shift covers SHIFT_HOURS waves)."""
+    return np.convolve(temps, np.ones(cfg.SHIFT_HOURS))[:W]
+
+
+def _add_flows(solver, objective, demand, deps, rate, base, h, W, floor_cap, crowding):
+    """Capacity rows per wave and one picking queue per (state, tier, target truck)."""
+    H, S, V = demand.shape
+    inf = solver.infinity()
+    # Capacity per wave: permanent pickers plus temps on shift, split into "calm" temps (up to
+    # the crowding threshold, TEMP_RATE each) and "crowded" temps (CROWDED_RATE each, up to
+    # the floor cap). Calm slots give more capacity for the same cost, so the LP fills them
+    # first; that makes capacity concave in headcount without integer variables.
+    cap = []
+    for w in range(W):
+        calm = solver.NumVar(0, crowding - base, "")
+        crowded = solver.NumVar(0, floor_cap - crowding, "")
+        split = solver.Constraint(0, 0)  # calm + crowded = temps on shift
+        split.SetCoefficient(calm, 1)
+        split.SetCoefficient(crowded, 1)
+        for t in range(max(0, w - cfg.SHIFT_HOURS + 1), min(w, H - 1) + 1):
+            split.SetCoefficient(h[t], -1)
+        c = solver.Constraint(-inf, cfg.PERM_RATE * base)
+        c.SetCoefficient(calm, -cfg.TEMP_RATE)
+        c.SetCoefficient(crowded, -cfg.CROWDED_RATE)
+        cap.append(c)
+
+    picks = []    # (s, v, delay_h, var)
+    leftover = []  # (s, v, var) queue left at the end
+    for s in range(S):
+        # truck[w]: index of the departure caught by wave w
+        truck = np.searchsorted(deps[s], np.arange(W) + 1 + cfg.LOADING_BUFFER_H)
+        target = truck[1:H + 1]  # target truck of orders arriving in each hour
+        for i in np.unique(target):
+            hours = np.flatnonzero(target == i)  # contiguous arrival hours sharing this target
+            for v in range(V):
+                if not demand[hours, s, v].any():
+                    continue
+                queue = None  # orders waiting before this wave
+                for w in range(hours[0] + 1, min(hours[-1] + 1 + LOOKAHEAD, W)):
+                    arriving = demand[w - 1, s, v] if w - 1 in hours else 0.0
+                    x = solver.NumVar(0, inf, "")
+                    q = solver.NumVar(0, inf, "")
+                    # queue after wave w = queue before + arrivals - picks
+                    balance = solver.Constraint(arriving, arriving)
+                    balance.SetCoefficient(q, 1)
+                    balance.SetCoefficient(x, 1)
+                    if queue is not None:
+                        balance.SetCoefficient(queue, -1)
+                    cap[w].SetCoefficient(x, 1)
+                    delay = deps[s][truck[w]] - deps[s][i]
+                    objective.SetCoefficient(x, delay * rate[v])
+                    picks.append((s, v, delay, x))
+                    queue = q
+                objective.SetCoefficient(queue, BACKLOG_DELAY_H * rate[v])
+                leftover.append((s, v, queue))
+    return picks, leftover

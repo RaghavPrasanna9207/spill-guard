@@ -42,6 +42,21 @@ def test_zero_penalty_hires_nobody():
     assert solve(penalty_scale=0).temps.sum() == 0
 
 
+def test_floor_cap_limits_hiring():
+    # The 2x penalty wants 2 temps, but a 2-picker floor leaves room for 1 temp, and with
+    # crowding at the permanent headcount that temp picks CROWDED_RATE: 50 - 25 spill.
+    plan = solve(penalty_scale=2, floor_cap=2, crowding=1)
+    assert plan.temps.sum() == 1
+    assert plan.spilled.sum() == pytest.approx(50 - cfg.CROWDED_RATE)
+
+
+def test_crowded_temps_pick_less():
+    # With crowding at the permanent headcount, the one allowed temp adds CROWDED_RATE
+    # (25/h) instead of TEMP_RATE (40/h): 50 - 25 = 25 spill instead of 10.
+    plan = solve(max_temps=1, crowding=1)
+    assert plan.spilled.sum() == pytest.approx(50 - cfg.CROWDED_RATE)
+
+
 def test_lp_with_milp_headcount_reproduces_milp():
     milp = solve(max_temps=1)
     lp = solve(fixed_temps=milp.temps)

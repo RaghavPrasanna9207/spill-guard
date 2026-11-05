@@ -41,6 +41,13 @@ LOADING_BUFFER_H = 1             # a wave must finish 1h before its truck depart
 PERM_RATE = 50                   # orders/h, experienced permanent picker
 TEMP_RATE = 40                   # orders/h, new temp picker
 SHIFT_HOURS = 8
+# Floor limits. Aisle space, carts and scanners cap how many pickers can work at once, and
+# crowded aisles make each extra picker add less (picker blocking).
+# Both scale with the permanent headcount, so they move with FC volume. At 20k orders on the
+# peak day (4 permanent pickers) this is a 16-picker floor that congests above 12.
+FLOOR_CAP_MULT = 4               # ASSUMPTION: floor holds 4x the permanent headcount
+CROWDING_MULT = 3                # ASSUMPTION: aisles congest above 3x (75% of the floor)
+CROWDED_RATE = 25                # ASSUMPTION: orders/h added by each picker above the threshold
 # ponytail: capacity counted in orders/h, not items; ~1.14 items/order makes the gap small.
 TEMP_MONTHLY_WAGE = 2110         # R$, SP logistics temp job ads 2026 (R$2,000-2,120)
 WORKDAYS_PER_MONTH = 22
