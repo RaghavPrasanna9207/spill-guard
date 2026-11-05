@@ -15,7 +15,7 @@ POLICIES = ("fifo", "earliest_truck", "replan")
 
 
 def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, replan_every=2,
-        penalty_scale=1.0, floor_cap=None, crowding=None, pack_cap=None, deps=None):
+        penalty_scale=1.0, deps=None, **limits):
     """Simulate one realisation; returns a model.Plan of what actually happened.
 
     forecast: [hour, state, tier] demand the re-plan expects for hours not yet seen.
@@ -25,13 +25,12 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
         70% of it building), so hourly runs take ~12 s on 72h; every 2 h costs ~1% more
         spill. Upgrade: build the LP once and update the backlog right-hand sides.
     deps: departure-time arrays per state (defaults to the configured truck schedule).
+    limits: floor_cap, crowding, pack_cap, as for model.solve.
     """
     H, S, V = actual.shape
     W = H + model.LOOKAHEAD
     temps = np.asarray(temps, float)
-    crowding = cfg.CROWDING_MULT * base if crowding is None else crowding
-    if pack_cap is None:
-        pack_cap = cfg.PACK_STATIONS_MULT * base * cfg.PACK_RATE
+    lim = model.resolve_limits(base, **limits)
     rate = model.delay_cost_per_hour(tier_values, penalty_scale)
     if deps is None:
         deps = [model.departures(s, W + model.BACKLOG_DELAY_H + 48) for s in cfg.DEST_STATES]
@@ -50,10 +49,10 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
         speed = np.maximum(rng.normal(1, cfg.PICK_SPEED_SD, W), 0)
     else:
         arrivals, perm, temp, speed = actual.astype(float), np.full(W, base), on, np.ones(W)
-    calm = np.minimum(temp, crowding - base)
+    calm = np.minimum(temp, lim.crowding - base)
     picking = speed * (cfg.PERM_RATE * perm + cfg.TEMP_RATE * calm
                        + cfg.CROWDED_RATE * (temp - calm))
-    capacity = np.minimum(picking, pack_cap)
+    capacity = np.minimum(picking, lim.pack_cap)
 
     hours = np.arange(H)
     rem = np.zeros((H, S, V))  # orders waiting, by arrival hour
@@ -73,7 +72,7 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
         elif policy == "replan":
             if (w - 1) % replan_every == 0:
                 planned = _replan(rem, forecast, w, tier_values, base, temps, deps,
-                                  penalty_scale, floor_cap, crowding, pack_cap)
+                                  penalty_scale, limits)
             picked = _oldest_first(rem, planned[w])
             if picked.sum() > cap:  # fewer pickers turned up than the LP assumed
                 picked *= cap / picked.sum()
@@ -112,8 +111,7 @@ def _mean_ci(xs):
     return xs.mean(), 1.96 * xs.std(ddof=1) / np.sqrt(len(xs))
 
 
-def _replan(rem, forecast, w, tier_values, base, temps, deps, penalty_scale, floor_cap, crowding,
-            pack_cap):
+def _replan(rem, forecast, w, tier_values, base, temps, deps, penalty_scale, limits):
     """LP picks per wave from wave w on, with the real backlog and the forecast for later hours.
 
     The backlog enters as orders that arrived in hour w-1. That is exact for decisions: any
@@ -128,7 +126,7 @@ def _replan(rem, forecast, w, tier_values, base, temps, deps, penalty_scale, flo
     t = np.zeros(n)
     t[:H] = temps
     return model.wave_picks(demand, tier_values, base, t, deps=deps, penalty_scale=penalty_scale,
-                            floor_cap=floor_cap, crowding=crowding, pack_cap=pack_cap)
+                            **limits)
 
 
 def _take(rem, cap, key):
