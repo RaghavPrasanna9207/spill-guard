@@ -223,10 +223,48 @@ def wave_picks(demand, tier_values, base, temps, overtime, deps=None, penalty_sc
     zeros to the LP's waves."""
     lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, limits)
     lp.cost(temps, np.pad(overtime, (0, lp.W - len(overtime))))
-    out = np.zeros((lp.W,) + demand.shape[1:])
-    for s, v, w, _, x in lp.picks:
-        out[w, s, v] += x.solution_value()
-    return out, np.array([v.solution_value() for v in lp.o])
+    return lp.picks_per_wave()
+
+
+class Replanner:
+    """Rolling re-plan with temps fixed, for one simulation run.
+
+    The LP is built once from the forecast. Each call resets only the arrival rows (zero before
+    hour w-1, the real backlog in hour w-1, the forecast after) and the overtime bounds, so
+    GLOP re-solves from its last basis. The backlog enters as orders that arrived in hour w-1.
+    That is exact for decisions: any waiting order whose target truck is still reachable
+    shares that hour's target, and delay already locked in on the rest is a constant.
+    """
+
+    def __init__(self, forecast, tier_values, base, temps, deps=None, penalty_scale=1.0,
+                 **limits):
+        self.forecast, self.temps = forecast, np.asarray(temps, float)
+        self.args = (tier_values, base)
+        self.kw = dict(deps=deps, penalty_scale=penalty_scale, **limits)
+        self.lp = _WaveLP(forecast, tier_values, base, deps, penalty_scale, None, limits)
+
+    def __call__(self, backlog, w, overtime):
+        """(orders [wave, state, tier] picked per wave, overtime per wave) from wave w on.
+
+        backlog: [state, tier] orders waiting before wave w. overtime: per wave, NaN where the
+        LP may choose it.
+        """
+        H = len(self.forecast)
+        demand = np.zeros((max(H, w),) + self.forecast.shape[1:])
+        demand[w:H] = self.forecast[w:H]
+        demand[w - 1] = backlog
+        S, V = backlog.shape
+        if all((w - 1, s, v) in self.lp.arrive for s in range(S) for v in range(V)
+               if backlog[s, v] > 0):
+            for (a, s, v), row in self.lp.arrive.items():
+                row.SetBounds(demand[a, s, v], demand[a, s, v])
+            self.lp.cost(self.temps, np.pad(overtime, (0, self.lp.W - len(overtime))))
+            return self.lp.picks_per_wave()
+        # After the window, or where the forecast had no orders, there is no row to hold the
+        # backlog: rebuild for this call.
+        t = np.zeros(len(demand))
+        t[:H] = self.temps
+        return wave_picks(demand, *self.args, t, overtime, **self.kw)
 
 
 def marginal_roi(demand, tier_values, base, temps, deps=None, penalty_scale=1.0, **limits):
@@ -272,7 +310,7 @@ class _WaveLP:
         inf = solver.infinity()
         h = self.h = [solver.NumVar(0, inf, f"h{t}") for t in range(H)]
         objective = solver.Objective()
-        self.picks, self.leftover, self.o = _add_flows(
+        self.picks, self.leftover, self.o, self.arrive = _add_flows(
             solver, objective, demand, deps, rate, base, h, W, lim)
         for day in range(0, W, 24):  # overtime hours per day, all permanent pickers together
             c = solver.Constraint(0, lim.overtime_daily)
@@ -295,6 +333,13 @@ class _WaveLP:
             for t in hours:
                 c.SetCoefficient(h[t], 1)
         objective.SetMinimization()
+
+    def picks_per_wave(self):
+        """(orders [wave, state, tier] picked per wave, overtime per wave) at the last solve."""
+        out = np.zeros((self.W,) + self.demand.shape[1:])
+        for s, v, w, _, x in self.picks:
+            out[w, s, v] += x.solution_value()
+        return out, np.array([v.solution_value() for v in self.o])
 
     def can_add(self, temps, t):
         """Whether one more temp can start at hour t: within the temp cap, room on the floor for
@@ -396,6 +441,7 @@ def _add_flows(solver, objective, demand, deps, rate, base, h, W, lim):
 
     picks = []    # (s, v, wave, delay_h, var)
     leftover = []  # (s, v, var) queue left at the end
+    arrive = {}   # (arrival hour, s, v) -> balance row whose right-hand side is that demand
     for s in range(S):
         # truck[w]: index of the departure caught by wave w
         truck = np.searchsorted(deps[s], np.arange(W) + 1 + cfg.LOADING_BUFFER_H)
@@ -412,6 +458,8 @@ def _add_flows(solver, objective, demand, deps, rate, base, h, W, lim):
                     q = solver.NumVar(0, inf, "")
                     # queue after wave w = queue before + arrivals - picks
                     balance = solver.Constraint(arriving, arriving)
+                    if w - 1 in hours:
+                        arrive[w - 1, s, v] = balance
                     balance.SetCoefficient(q, 1)
                     balance.SetCoefficient(x, 1)
                     if queue is not None:
@@ -424,4 +472,4 @@ def _add_flows(solver, objective, demand, deps, rate, base, h, W, lim):
                     queue = q
                 objective.SetCoefficient(queue, BACKLOG_DELAY_H * rate[v])
                 leftover.append((s, v, queue))
-    return picks, leftover, overtime
+    return picks, leftover, overtime, arrive

@@ -68,6 +68,28 @@ def test_replan_keeps_a_picker_late_when_demand_beats_the_forecast():
     assert sim.run(*args, "earliest_truck", noise=False, deps=deps).spilled.sum() == pytest.approx(50)
 
 
+def test_persistent_replan_matches_rebuilding_the_lp(monkeypatch):
+    # Dense forecast, so every arrival hour has a row. Demand runs 30% under it, so the real
+    # backlog differs from what the LP was built with: a re-plan that never updated its
+    # arrival rows costs R$391.55 here, not R$376.80. (Over the forecast, capacity saturates
+    # and every re-plan ties.)
+    forecast = np.random.default_rng(0).uniform(100, 200, (6, 1, 1))
+    deps = [np.array([3.0, 27.0, 51.0, 75.0, 99.0, 123.0])]
+    temps = np.array([0, 1, 0, 0, 0, 1])  # one night start, within the 1.5 night cap
+    args = (forecast, 0.7 * forecast, VALUES, 1, temps, "replan")
+    persistent = sim.run(*args, noise=False, deps=deps, replan_every=1)
+    init = model.Replanner.__init__
+
+    def rebuild_every_call(self, *a, **k):
+        init(self, *a, **k)
+        self.lp.arrive = {}  # no arrival rows: every call takes the rebuild path
+
+    monkeypatch.setattr(model.Replanner, "__init__", rebuild_every_call)
+    rebuilt = sim.run(*args, noise=False, deps=deps, replan_every=1)
+    assert persistent.spill_cost + persistent.labour_cost == pytest.approx(
+        rebuilt.spill_cost + rebuilt.labour_cost)
+
+
 def test_earliest_truck_beats_fifo_when_trucks_differ():
     # 50 orders each for state A (truck 03:00) and B (truck 10:00) arrive together; one picker.
     # FIFO splits wave 1 evenly, so 25 A orders miss 03:00. Picking A first spills nothing.

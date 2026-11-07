@@ -21,9 +21,10 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
     forecast: [hour, state, tier] demand the re-plan expects for hours not yet seen.
     actual: [hour, state, tier] mean realised demand (Poisson-sampled when noise is on).
     temps: temp shifts by start hour, fixed for every policy.
-    replan_every: hours between re-plan solves. ponytail: each solve rebuilds the LP (~0.15 s,
-        70% of it building), so hourly runs take ~12 s on 72h; every 2 h costs ~1% more
-        spill. Upgrade: build the LP once and update the backlog right-hand sides.
+    replan_every: hours between re-plan solves. ponytail: solving now dominates (the LP is
+        built once per run, 1.6x faster than rebuilding), so hourly runs take about twice as
+        long as the 2-hour default, which costs ~1% more spill. Upgrade: cache results per
+        scenario in the app, or OR-Tools MathOpt for incremental GLOP solves.
     deps: departure-time arrays per state (defaults to the configured truck schedule).
     overtime: planned permanent overtime picker-hours per wave (Plan.overtime). FIFO and
         earliest-truck keep it; not hit by absence, since those pickers are already on shift.
@@ -58,6 +59,9 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
     else:
         arrivals, perm, temp, speed = actual.astype(float), np.full(W, base), on, np.ones(W)
 
+    if policy == "replan":
+        replanner = model.Replanner(forecast, tier_values, base, temps, deps=deps,
+                                    penalty_scale=penalty_scale, **limits)
     hours = np.arange(H)
     rem = np.zeros((H, S, V))  # orders waiting, by arrival hour
     spilled = np.zeros((S, V))
@@ -72,8 +76,7 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
             free = ot.copy()
             if same_day_overtime:
                 free[w:] = np.nan
-            planned, chosen = _replan(rem, forecast, w, tier_values, base, temps, free, deps,
-                                      penalty_scale, limits)
+            planned, chosen = replanner(rem.sum(0), w, free)
             ot[w:] = chosen[w:W]
         # Overtime pickers take floor slots like temps and add the experience gap, as in the LP.
         slots = temp[w] + ot[w]
@@ -125,24 +128,6 @@ def _mean_ci(xs):
     # ponytail: normal 1.96, about 15% narrower than Student-t at 10 runs, 4% at 30.
     xs = np.asarray(xs)
     return xs.mean(), 1.96 * xs.std(ddof=1) / np.sqrt(len(xs))
-
-
-def _replan(rem, forecast, w, tier_values, base, temps, overtime, deps, penalty_scale, limits):
-    """LP picks per wave from wave w on, with the real backlog and the forecast for later hours.
-
-    The backlog enters as orders that arrived in hour w-1. That is exact for decisions: any
-    waiting order whose target truck is still reachable shares that hour's target, and delay
-    already locked in on the rest is a constant.
-    """
-    H = len(forecast)
-    n = max(H, w)
-    demand = np.zeros((n,) + forecast.shape[1:])
-    demand[w:H] = forecast[w:H]
-    demand[w - 1] = rem.sum(0)
-    t = np.zeros(n)
-    t[:H] = temps
-    return model.wave_picks(demand, tier_values, base, t, overtime, deps=deps,
-                            penalty_scale=penalty_scale, **limits)
 
 
 def _take(rem, cap, key):
