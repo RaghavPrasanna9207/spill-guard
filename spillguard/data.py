@@ -87,6 +87,18 @@ def tier_values(orders):
     return orders.groupby("tier").value.mean().reindex(range(V)).to_numpy()
 
 
+def hindsight_surges(orders):
+    """(Black Friday, weekend) surges that make the forecast's day totals match realised demand.
+
+    Known only after the fact: Olist has no orders in November 2016, so nothing in the data
+    forecasts the 2017 spike.
+    """
+    days = cfg.HOURS // 24
+    act, fc = (x.sum((1, 2)).reshape(days, 24).sum(1)
+               for x in (actual_demand(orders), forecast_demand(orders)))
+    return act[0] / fc[0], act[1:].sum() / fc[1:].sum()
+
+
 def wape(forecast, actual):
     """Weighted absolute percentage error of hourly totals."""
     f, a = forecast.sum((1, 2)), actual.sum((1, 2))
@@ -97,7 +109,7 @@ if __name__ == "__main__":
     o = load_orders()
     act, fc = actual_demand(o), forecast_demand(o)
     act_day, fc_day = (x.sum((1, 2)).reshape(3, 24).sum(1) for x in (act, fc))
-    peak, weekend = act_day[0] / fc_day[0], act_day[1:].sum() / fc_day[1:].sum()
+    peak, weekend = hindsight_surges(o)
     print(f"orders kept: {len(o)}  scale x{scale_factor(o):.1f}")
     print("actual per day:", act_day.round(), " forecast per day (surge 1):", fc_day.round())
     print(f"hindsight surges: peak {peak:.2f}, weekend {weekend:.2f}")

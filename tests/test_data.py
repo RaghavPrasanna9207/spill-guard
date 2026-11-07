@@ -39,6 +39,13 @@ def test_actual_demand_keeps_day_totals_and_window_mix():
     assert np.abs(np.diff(act.sum((1, 2)))).max() < np.abs(np.diff(raw.sum((1, 2)))).max()
 
 
+def test_hindsight_surges_match_realised_day_totals():
+    act = data.actual_demand(orders).sum((1, 2)).reshape(3, 24).sum(1)
+    fc = data.forecast_demand(orders, *data.hindsight_surges(orders)).sum((1, 2)).reshape(3, 24).sum(1)
+    assert fc[0] == pytest.approx(act[0])
+    assert fc[1:].sum() == pytest.approx(act[1:].sum())
+
+
 def test_forecast_days_match_weekday_averages():
     # Independent check with pandas: mean Fri/Sat/Sun totals over the profile weeks.
     start = pd.Timestamp(cfg.WINDOW_START)

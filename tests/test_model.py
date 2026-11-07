@@ -136,7 +136,7 @@ needs_olist = pytest.mark.skipif(not (data.RAW / "olist_orders_dataset.csv").exi
 def black_friday():
     orders = data.load_orders()
     base = model.base_headcount(data.forecast_demand(orders))
-    demand = data.forecast_demand(orders, peak_surge=7.5, weekend_surge=3.3)  # ~hindsight surges
+    demand = data.forecast_demand(orders, *data.hindsight_surges(orders))
     return demand, data.tier_values(orders), base
 
 
