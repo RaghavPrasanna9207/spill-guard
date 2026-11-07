@@ -28,6 +28,17 @@ def test_peak_day_scales_to_target():
     assert data.actual_demand(orders)[:24].sum() == pytest.approx(cfg.PEAK_DAY_ORDERS)
 
 
+def test_actual_demand_keeps_day_totals_and_window_mix():
+    raw = data.counts(orders, cfg.WINDOW_START, cfg.HOURS) * data.scale_factor(orders)
+    act = data.actual_demand(orders)
+    np.testing.assert_allclose(act.sum((1, 2)).reshape(3, 24).sum(1),
+                               raw.sum((1, 2)).reshape(3, 24).sum(1))
+    np.testing.assert_allclose(act / act.sum((1, 2), keepdims=True),
+                               np.broadcast_to(raw.sum(0) / raw.sum(), act.shape))
+    # Smoothing removes the hour-to-hour jumps of ~14 raw orders an hour.
+    assert np.abs(np.diff(act.sum((1, 2)))).max() < np.abs(np.diff(raw.sum((1, 2)))).max()
+
+
 def test_forecast_days_match_weekday_averages():
     # Independent check with pandas: mean Fri/Sat/Sun totals over the profile weeks.
     start = pd.Timestamp(cfg.WINDOW_START)

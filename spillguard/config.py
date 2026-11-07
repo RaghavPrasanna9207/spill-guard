@@ -6,6 +6,9 @@ WINDOW_START = "2017-11-24"      # Black Friday 2017 (Fri), start of the 72h win
 HOURS = 72
 PEAK_DAY_ORDERS = 20_000         # realised Black Friday day is scaled to this volume
 PROFILE_WEEKS = 4                # weeks before Black Friday used for the planning profile
+# Realised demand: raw hours are compared with the mean of their neighbours. Residuals match
+# Poisson noise at 3 h (dispersion 0.59); wider windows start erasing real shape (5 h: 1.27).
+ACTUAL_SMOOTH_H = 3              # hours in the moving average of realised hourly demand
 # Top 8 destination states of SP-seller orders (86% of volume); others are dropped.
 DEST_STATES = ["SP", "RJ", "MG", "RS", "PR", "BA", "SC", "ES"]
 TIER_NAMES = ["low", "mid", "high"]  # order-value terciles, cut points computed in data.py

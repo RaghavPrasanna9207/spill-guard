@@ -46,8 +46,21 @@ def scale_factor(orders):
 
 
 def actual_demand(orders):
-    """Realised Black Friday weekend demand, scaled to FC volume."""
-    return counts(orders, cfg.WINDOW_START, cfg.HOURS) * scale_factor(orders)
+    """Realised Black Friday weekend demand at FC volume, as an expected hourly rate.
+
+    The window holds ~1,300 Olist orders (~14 an hour) scaled ~27x, and 92% of hour x state x
+    tier cells have 0-2 orders, so raw scaled counts are far lumpier than a 20k-a-day FC.
+    Kept: each day's total, the hourly shape smoothed over ACTUAL_SMOOTH_H hours, and the
+    window's state/tier mix. sim.py adds Poisson noise at FC scale.
+    """
+    raw = counts(orders, cfg.WINDOW_START, cfg.HOURS)
+    hourly = raw.sum((1, 2))
+    k = cfg.ACTUAL_SMOOTH_H
+    smooth = np.convolve(np.pad(hourly, k // 2, mode="edge"), np.ones(k) / k, "valid")
+    day = np.arange(cfg.HOURS) // 24
+    smooth *= (np.bincount(day, hourly) / np.bincount(day, smooth))[day]  # keep each day's total
+    mix = raw.sum(0) / raw.sum()
+    return smooth[:, None, None] * mix * scale_factor(orders)
 
 
 def forecast_demand(orders, peak_surge=1.0, weekend_surge=1.0, buffer=1.0):
