@@ -82,6 +82,11 @@ class Plan:
         return self.total_cost / self.lower_bound - 1
 
     @property
+    def gap_cost(self):
+        """The same gap in R$: on small totals one temp's wage can read as a large fraction."""
+        return self.total_cost - self.lower_bound
+
+    @property
     def total_cost(self):
         return self.labour_cost + self.spill_cost
 

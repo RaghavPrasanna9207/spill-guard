@@ -170,8 +170,7 @@ def test_marginal_roi_matches_frontier_slope():
         roi = model.marginal_roi(demand, vals, base, plan.temps, **kw)
         slope = plan.lower_bound - model.solve(demand, vals, base, max_temps=cap + 1,
                                                **kw).lower_bound
-        gap = plan.total_cost - plan.lower_bound
-        assert abs(roi.net.max() - slope) <= gap + 1e-6
+        assert abs(roi.net.max() - slope) <= plan.gap_cost + 1e-6
     assert roi.net.isna().any()  # Black Friday's peak fills the floor
 
 
