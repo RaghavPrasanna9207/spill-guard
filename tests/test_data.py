@@ -46,6 +46,12 @@ def test_hindsight_surges_match_realised_day_totals():
     assert fc[1:].sum() == pytest.approx(act[1:].sum())
 
 
+def test_planning_forecast_buffer_scales_volume():
+    base = data.planning_forecast(orders)
+    np.testing.assert_allclose(data.planning_forecast(orders, buffer=0.8), base * 0.8)
+    assert base[:24].sum() == pytest.approx(cfg.PEAK_DAY_ORDERS)  # perfect volume forecast
+
+
 def test_forecast_days_match_weekday_averages():
     # Independent check with pandas: mean Fri/Sat/Sun totals over the profile weeks.
     start = pd.Timestamp(cfg.WINDOW_START)

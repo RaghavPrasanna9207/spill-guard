@@ -99,6 +99,13 @@ def hindsight_surges(orders):
     return act[0] / fc[0], act[1:].sum() / fc[1:].sum()
 
 
+def planning_forecast(orders, buffer=1.0):
+    """Default base case: the forecast at hindsight surges, a perfect volume forecast with the
+    pre-peak hourly shape. buffer is the volume-error knob: 0.8 plans 20% low, 1.2 20% high.
+    """
+    return forecast_demand(orders, *hindsight_surges(orders), buffer=buffer)
+
+
 def wape(forecast, actual):
     """Weighted absolute percentage error of hourly totals."""
     f, a = forecast.sum((1, 2)), actual.sum((1, 2))
