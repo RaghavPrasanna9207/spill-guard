@@ -20,7 +20,7 @@ def test_spill_accounting_matches_lp():
     temps = np.array([0, 1, 0, 0])
     lp = model.solve(demand, VALUES, 1, deps=deps, fixed_temps=temps, overtime_daily=0)
     for policy in sim.POLICIES:
-        plan = run(demand, deps, policy, temps)
+        plan = run(demand, deps, policy, temps, overtime_daily=0)
         assert plan.spilled.sum() == pytest.approx(10)
         assert plan.spill_cost == pytest.approx(lp.spill_cost) == pytest.approx(150)
 
@@ -33,7 +33,7 @@ def test_packing_caps_simulated_picks():
     lp = model.solve(demand, VALUES, 1, deps=deps, fixed_temps=temps, pack_cap=60,
                      overtime_daily=0)
     for policy in sim.POLICIES:
-        plan = run(demand, deps, policy, temps, pack_cap=60)
+        plan = run(demand, deps, policy, temps, pack_cap=60, overtime_daily=0)
         assert plan.spilled.sum() == pytest.approx(40)
         assert plan.spill_cost == pytest.approx(lp.spill_cost)
 
@@ -49,6 +49,23 @@ def test_sim_uses_planned_overtime():
         out = run(demand, deps, policy, plan.temps, overtime=plan.overtime)
         assert out.spilled.sum() == pytest.approx(0)
         assert out.labour_cost == pytest.approx(plan.labour_cost)
+
+
+def test_replan_keeps_a_picker_late_when_demand_beats_the_forecast():
+    # The day-before plan expected 50 orders (no temps, no overtime); 100 arrive. Seeing the
+    # backlog, the re-plan keeps the permanent picker one extra hour for the other 50.
+    actual = np.zeros((4, 1, 1))
+    actual[0, 0, 0] = 100
+    forecast = actual / 2
+    deps = [np.array([3.0, 27.0, 51.0, 75.0, 99.0, 123.0])]
+    args = (forecast, actual, VALUES, 1, np.zeros(4))
+    late = sim.run(*args, "replan", noise=False, deps=deps)
+    assert late.spilled.sum() == pytest.approx(0)
+    assert late.overtime.sum() == pytest.approx(1)
+    assert late.labour_cost == pytest.approx(model.overtime_cost(1))
+    fixed = sim.run(*args, "replan", noise=False, deps=deps, same_day_overtime=False)
+    assert fixed.spilled.sum() == pytest.approx(50)
+    assert sim.run(*args, "earliest_truck", noise=False, deps=deps).spilled.sum() == pytest.approx(50)
 
 
 def test_earliest_truck_beats_fifo_when_trucks_differ():

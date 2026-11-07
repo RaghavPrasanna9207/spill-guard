@@ -213,14 +213,15 @@ def frontier(demand, tier_values, base, points=15, deps=None, penalty_scale=1.0,
 
 def wave_picks(demand, tier_values, base, temps, overtime, deps=None, penalty_scale=1.0,
                **limits):
-    """Orders [wave, state, tier] the LP picks in each wave with temps and overtime fixed
-    (rolling re-plan). overtime: picker-hours per wave, padded with zeros to the LP's waves."""
+    """Rolling re-plan with temps fixed: (orders [wave, state, tier] picked per wave, overtime
+    picker-hours per wave). overtime: per wave, NaN where the LP may choose it, padded with
+    zeros to the LP's waves."""
     lp = _WaveLP(demand, tier_values, base, deps, penalty_scale, None, limits)
     lp.cost(temps, np.pad(overtime, (0, lp.W - len(overtime))))
     out = np.zeros((lp.W,) + demand.shape[1:])
     for s, v, w, _, x in lp.picks:
         out[w, s, v] += x.solution_value()
-    return out
+    return out, np.array([v.solution_value() for v in lp.o])
 
 
 def marginal_roi(demand, tier_values, base, temps, deps=None, penalty_scale=1.0, **limits):
@@ -314,12 +315,13 @@ class _WaveLP:
         return np.array([v.solution_value() for v in self.h])
 
     def cost(self, temps, overtime=None):
-        """Total cost (R$) with temps pinned to `temps`; overtime too if given, else optimised."""
+        """Total cost (R$) with temps pinned to `temps`. Overtime is pinned where given and
+        optimised where omitted or NaN."""
         for v, n in zip(self.h, temps):
             v.SetBounds(n, n)
         if overtime is not None:
             for v, n in zip(self.o, overtime):
-                v.SetBounds(n, n)
+                v.SetBounds(*((0, self.base) if np.isnan(n) else (n, n)))
         return self._solve()
 
     def plan(self):

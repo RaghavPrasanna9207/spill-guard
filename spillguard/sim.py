@@ -15,7 +15,7 @@ POLICIES = ("fifo", "earliest_truck", "replan")
 
 
 def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, replan_every=2,
-        penalty_scale=1.0, deps=None, overtime=None, **limits):
+        penalty_scale=1.0, deps=None, overtime=None, same_day_overtime=True, **limits):
     """Simulate one realisation; returns a model.Plan of what actually happened.
 
     forecast: [hour, state, tier] demand the re-plan expects for hours not yet seen.
@@ -25,8 +25,11 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
         70% of it building), so hourly runs take ~12 s on 72h; every 2 h costs ~1% more
         spill. Upgrade: build the LP once and update the backlog right-hand sides.
     deps: departure-time arrays per state (defaults to the configured truck schedule).
-    overtime: planned permanent overtime picker-hours per wave (Plan.overtime), fixed for every
-        policy like temps; not hit by absence, since those pickers are already on shift.
+    overtime: planned permanent overtime picker-hours per wave (Plan.overtime). FIFO and
+        earliest-truck keep it; not hit by absence, since those pickers are already on shift.
+    same_day_overtime: the re-plan re-chooses overtime from the real backlog for every wave not
+        yet worked, within the same caps (hours already worked count toward the day's cap).
+        Labour cost counts the overtime actually worked.
     limits: floor_cap, crowding, pack_cap, as for model.solve.
     """
     H, S, V = actual.shape
@@ -54,11 +57,6 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
         speed = np.maximum(rng.normal(1, cfg.PICK_SPEED_SD, W), 0)
     else:
         arrivals, perm, temp, speed = actual.astype(float), np.full(W, base), on, np.ones(W)
-    slots = temp + ot  # overtime pickers take floor slots like temps, as in the LP
-    calm = np.minimum(slots, lim.crowding - base)
-    picking = speed * (cfg.PERM_RATE * perm + cfg.TEMP_RATE * calm
-                       + cfg.CROWDED_RATE * (slots - calm) + (cfg.PERM_RATE - cfg.TEMP_RATE) * ot)
-    capacity = np.minimum(picking, lim.pack_cap)
 
     hours = np.arange(H)
     rem = np.zeros((H, S, V))  # orders waiting, by arrival hour
@@ -69,16 +67,26 @@ def run(forecast, actual, tier_values, base, temps, policy, noise=True, seed=0, 
             rem[w - 1] += arrivals[w - 1]
         elif rem.sum() < 1e-9:
             break  # all orders picked and no more arriving
-        cap = capacity[w]
         earliest_truck = dep_at[w][None, :] * 1000 + hours[:, None]  # then oldest first
+        if policy == "replan" and (w - 1) % replan_every == 0:
+            free = ot.copy()
+            if same_day_overtime:
+                free[w:] = np.nan
+            planned, chosen = _replan(rem, forecast, w, tier_values, base, temps, free, deps,
+                                      penalty_scale, limits)
+            ot[w:] = chosen[w:W]
+        # Overtime pickers take floor slots like temps and add the experience gap, as in the LP.
+        slots = temp[w] + ot[w]
+        calm = min(slots, lim.crowding - base)
+        picking = speed[w] * (cfg.PERM_RATE * perm[w] + cfg.TEMP_RATE * calm
+                              + cfg.CROWDED_RATE * (slots - calm)
+                              + (cfg.PERM_RATE - cfg.TEMP_RATE) * ot[w])
+        cap = min(picking, lim.pack_cap)
         if policy == "fifo":
             picked = _take(rem, cap, np.broadcast_to(hours[:, None], (H, S)).astype(float))
         elif policy == "earliest_truck":
             picked = _take(rem, cap, earliest_truck)
         elif policy == "replan":
-            if (w - 1) % replan_every == 0:
-                planned = _replan(rem, forecast, w, tier_values, base, temps, ot, deps,
-                                  penalty_scale, limits)
             picked = _oldest_first(rem, planned[w])
             if picked.sum() > cap:  # fewer pickers turned up than the LP assumed
                 picked *= cap / picked.sum()
