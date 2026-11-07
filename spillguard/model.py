@@ -92,14 +92,14 @@ class Plan:
 
 def resolve_limits(base, floor_cap=None, crowding=None, pack_cap=None, agency_daily=None,
                    agency_night=None, overtime_daily=None):
-    """Floor and supply limits; unset ones default to config multiples of `base`.
+    """Floor and supply limits; unset ones default from config and `base`.
 
-    floor_cap: most pickers (permanent + temps) on the floor in any hour
-        (default FLOOR_CAP_MULT x base).
+    floor_cap: most pickers (permanent + temps) on the floor in any hour. Default: the fewest
+        whose full-floor rate covers the design peak day's average hour (PEAK_DAY_ORDERS / 24).
     crowding: above this many on the floor, each extra temp adds CROWDED_RATE, not TEMP_RATE
-        (default CROWDING_MULT x base).
-    pack_cap: most orders packed per wave, so most picked (default PACK_STATIONS_MULT x base
-        stations x PACK_RATE).
+        (default CROWDING_SHARE x floor_cap).
+    pack_cap: most orders packed per wave, so most picked. Default: enough PACK_RATE stations
+        for the design peak day's average hour.
     agency_daily: most temp shifts the agency fills per window day (default
         AGENCY_DAILY_MULT x base).
     agency_night: most of those starting in night hours, 22:00-04:00 (default
@@ -107,12 +107,17 @@ def resolve_limits(base, floor_cap=None, crowding=None, pack_cap=None, agency_da
     overtime_daily: most permanent overtime picker-hours per window day (default
         OVERTIME_MAX_H for each of the base x 24/SHIFT_HOURS permanent pickers; 0 turns it off).
     """
-    floor_cap = cfg.FLOOR_CAP_MULT * base if floor_cap is None else floor_cap
-    crowding = cfg.CROWDING_MULT * base if crowding is None else crowding
+    peak_hour = cfg.PEAK_DAY_ORDERS / 24
+    c = cfg.CROWDING_SHARE
+    if floor_cap is None:
+        # full-floor rate = PERM_RATE x base + TEMP_RATE x (c F - base) + CROWDED_RATE x (1 - c) F
+        per_slot = cfg.TEMP_RATE * c + cfg.CROWDED_RATE * (1 - c)
+        floor_cap = math.ceil((peak_hour - (cfg.PERM_RATE - cfg.TEMP_RATE) * base) / per_slot)
+    crowding = c * floor_cap if crowding is None else crowding
     if not base <= crowding <= floor_cap:
         raise ValueError("need base headcount <= crowding threshold <= floor cap")
     if pack_cap is None:
-        pack_cap = cfg.PACK_STATIONS_MULT * base * cfg.PACK_RATE
+        pack_cap = math.ceil(peak_hour / cfg.PACK_RATE) * cfg.PACK_RATE
     agency_daily = cfg.AGENCY_DAILY_MULT * base if agency_daily is None else agency_daily
     agency_night = cfg.AGENCY_NIGHT_MULT * base if agency_night is None else agency_night
     if overtime_daily is None:

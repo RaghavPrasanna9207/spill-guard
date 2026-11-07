@@ -46,10 +46,11 @@ TEMP_RATE = 40                   # orders/h, new temp picker
 SHIFT_HOURS = 8
 # Floor limits. Aisle space, carts and scanners cap how many pickers can work at once, and
 # crowded aisles make each extra picker add less (picker blocking).
-# Both scale with the permanent headcount, so they move with FC volume. At 20k orders on the
-# peak day (4 permanent pickers) this is a 16-picker floor that congests above 12.
-FLOOR_CAP_MULT = 4               # ASSUMPTION: floor holds 4x the permanent headcount
-CROWDING_MULT = 3                # ASSUMPTION: aisles congest above 3x (75% of the floor)
+# The FC is laid out for its design peak day (PEAK_DAY_ORDERS): the floor holds the fewest
+# pickers whose full-floor rate covers that day's average hour, and the pack line is sized the
+# same way (model.resolve_limits). At 20k orders and 4 permanent pickers: a 22-picker floor
+# (5.5x) that congests above 16.5, and 14 pack stations (840/h).
+CROWDING_SHARE = 0.75            # ASSUMPTION: aisles congest once the floor is 75% full
 CROWDED_RATE = 25                # ASSUMPTION: orders/h added by each picker above the threshold
 # Overtime for permanent pickers.
 PERM_MONTHLY_WAGE = 2086         # R$, Indeed median, separador de mercadorias, SP (57 salaries)
@@ -65,7 +66,6 @@ AGENCY_NIGHT_MULT = 1.5          # ASSUMPTION: of those, starts in night hours (
 # Packing. Manual single-item packing runs 40-80 orders per packer-hour (Racklify pack-rate
 # benchmarks, vendor figures); Olist orders are nearly all single-item.
 PACK_RATE = 60                   # orders/h per staffed pack station
-PACK_STATIONS_MULT = 2.5         # ASSUMPTION: pack stations per permanent picker (10 at 4 pickers)
 # ponytail: capacity counted in orders/h, not items; ~1.14 items/order makes the gap small.
 TEMP_MONTHLY_WAGE = 2110         # R$, SP logistics temp job ads 2026 (R$2,000-2,120)
 WORKDAYS_PER_MONTH = 22

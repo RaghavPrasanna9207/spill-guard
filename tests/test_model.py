@@ -159,15 +159,19 @@ def test_marginal_roi_skips_hours_with_a_full_floor():
 
 @needs_olist
 def test_marginal_roi_matches_frontier_slope():
-    # Best extra temp's net saving ~ the drop in the LP bound from one more allowed temp.
-    # Overtime off: as a continuous lever it absorbs fractional capacity differently in the
-    # whole-temp plan and the LP, which moves the two up to ~5% apart at some caps.
+    # Best extra temp's net saving vs the drop in the LP bound from one more allowed temp.
+    # The plan plus one temp fits under cap H+1, so it cannot beat that LP bound: the saving
+    # exceeds the slope by at most the plan's own gap to its bound. The lower side has no proof
+    # but held at every cap tried (30-60). Overtime off: the check targets temps.
     demand, vals, base = black_friday()
     kw = dict(overtime_daily=0)
-    plan = model.solve(demand, vals, base, max_temps=50, **kw)
-    roi = model.marginal_roi(demand, vals, base, plan.temps, **kw)
-    slope = plan.lower_bound - model.solve(demand, vals, base, max_temps=51, **kw).lower_bound
-    assert roi.net.max() == pytest.approx(slope, rel=0.05)
+    for cap in (30, 50):
+        plan = model.solve(demand, vals, base, max_temps=cap, **kw)
+        roi = model.marginal_roi(demand, vals, base, plan.temps, **kw)
+        slope = plan.lower_bound - model.solve(demand, vals, base, max_temps=cap + 1,
+                                               **kw).lower_bound
+        gap = plan.total_cost - plan.lower_bound
+        assert abs(roi.net.max() - slope) <= gap + 1e-6
     assert roi.net.isna().any()  # Black Friday's peak fills the floor
 
 
